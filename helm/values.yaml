@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/OWNER/gpt-web-gateway
+  repository: ghcr.io/stufently/gpt-web-gateway
   tag: ""
   pullPolicy: Always
 
