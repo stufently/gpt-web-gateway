@@ -1,5 +1,101 @@
 # Changelog
 
+## 2.14.0 — proactive pacing between jobs (2026-08-19)
+
+Rate limiting had only its reactive half. `RATE_LIMIT_COOLDOWN_MINUTES` arms **after** ChatGPT
+has already refused, and the queue serialises work without pacing it, so nothing stopped a
+client from firing job after job back to back for hours. ChatGPT's own anti-abuse noticed
+before we did: the account started answering *"You're making requests too quickly. We've
+temporarily limited access to your conversations"* — which locks the human owner out of their
+own interactive session, on their own account, while a batch pipeline keeps hammering.
+
+`MIN_JOB_GAP_SEC` (default **60**) is the missing half: a minimum idle stretch between one
+upstream turn finishing and the next starting. Every path pays it — generations, edits,
+`/v1/chat/completions`, `/v1/responses`.
+
+Four decisions worth keeping:
+
+- **The unit is ONE UPSTREAM TURN, not one HTTP request.** The first cut paced the queued job
+  instead, and a batch request sends up to ten prompts inside a single job: the limit would
+  have looked applied while ten turns went out back to back. Every actual send now goes through
+  one helper that gates, checks and stamps.
+- **The gap is measured from the previous turn's FINISH, not its start.** From the start it
+  would do nothing whenever the turn outlasts the gap, and these turns take a minute or more
+  each: the setting would have looked configured and changed nothing.
+- **The wait beats a heartbeat.** A waiting job holds a queue slot, and the liveness detector
+  reads "queued work, no progress" as a hang — it would restart a container doing exactly what
+  it was told, for any gap at or above `HEALTH_STUCK_SEC`. A deliberate pause is progress and
+  now says so; the startup warning below is only a second line of defence.
+- **The finish is stamped for failures too.** A refused or timed-out turn reached ChatGPT
+  exactly as a successful one did, and the account counts it; pacing on successes only would
+  let a failing batch run at full speed.
+
+### The reactive cooldown now binds jobs already in line
+
+`RATE_LIMIT_COOLDOWN_MINUTES` was checked once, before the job entered the queue, and never
+again. So the moment ChatGPT refused, every job already accepted kept going — paced, but
+against a 30-minute cooldown it was ignoring. That is exactly the traffic the cooldown exists
+to stop, and with a full queue it meant four more requests into a wall. The cooldown is now
+re-checked immediately before each upstream turn, and such a turn fails as `rate_limit`
+(which, unlike `server_error`, does not count toward the consecutive-infra-failure detector).
+The check runs on **both** sides of the pacing wait: an already-armed cooldown refuses at once
+rather than making the caller sit out a full gap first for a send that was never going to
+happen, and the second check catches a cooldown armed while it waited.
+
+A related hole in the same place: a rate limit on the **second or later** image of a batch was
+recorded as a partial-batch error and returned as success, so the cooldown never armed at all
+and the next request walked straight back into the wall. It arms now.
+
+### The cooldown could extend itself indefinitely
+
+The guard above raises an error whose message says *"rate limit is in effect"* — and
+`handleRateLimitError` arms the cooldown by matching that exact substring. So every turn the
+guard refused pushed the deadline out by another full cooldown **from now**: a client polling
+through a 30-minute cooldown would have held its own service shut for as long as it kept
+polling, logging a limit ChatGPT never sent each time. Our own refusals are now flagged and
+never arm anything; a real limit from ChatGPT still does.
+
+`scripts/test-cooldown.js` covers this at the router level, reaching into the module's cooldown
+state through a test-only surface. The 16 pacer tests all passed while this defect was live —
+it was in how the router *uses* the pacer, not in the pacer — and a test that cannot fail on the
+bug it describes is not a test: removing the guard turns that case red.
+
+### The wait could not be starved or mistimed
+
+- **A stalled clock can no longer hang the queue.** The remainder was recomputed from the clock
+  alone, so a clock that does not advance never shrinks it: the wait spins, beating every 30s
+  and never releasing its queue slot (verified — a million beats and still going). The remainder
+  now can only decrease, while a clock that jumps *forward* still ends the wait early.
+- **The beat now lands inside the liveness window.** `HEALTH_STUCK_SEC` has no lower bound, so a
+  fixed 30s cadence meant the probe fired before the first beat for any threshold under 30s —
+  killing a container for pacing exactly as told. The cadence is `min(30s, threshold/2)`.
+
+### Known and deliberately not fixed here
+
+A client that disconnects while its job waits is not cancelled — the job still runs and still
+spends an upstream turn. Longer waits make that more likely, so it is worth naming. The obvious
+fix (fail the job when the socket is gone) routes through `classifyError` into `server_error`,
+which the liveness detector counts as an infra failure: three abandoned clients in a row would
+mark the service dead and have the container restarted. Cancellation needs its own error class
+and its own tests, not a line bolted onto pacing.
+
+Two consequences of pacing that needed handling rather than documenting:
+
+- **`Retry-After` on `queue_full` now includes the gap** (`+ queueSize × gap`). Quoting the bare
+  `QUEUE_FULL_RETRY_AFTER_SEC` while pacing is on sends the client back before the queue can
+  possibly have drained; it gets 429 again, and every such probe is another request against the
+  very account the limit protects.
+- **A gap at or above `HEALTH_STUCK_SEC` is called out at startup.** With the heartbeat above
+  this is no longer an outage, but such a value is still unusually large: it is longer than the
+  window the liveness probe calls "hung", and every queued caller waits at least that long for
+  its turn. The value is obeyed — refusing it would override the operator — but it no longer
+  goes unnoticed.
+
+`GET /v1/images/status` now reports `pacing` (`min_gap_sec`, `next_slot_in_sec`,
+`throttled_seconds_total`): an invisible limit reads as a broken service, and without this the
+caller only sees response times growing. `MIN_JOB_GAP_SEC=0` disables pacing for a
+single-user instance that never batches.
+
 ## 2.13.1 — the 0600 repair could not run on an upgraded volume (2026-08-19)
 
 2.13.0 both dropped root and started writing `auth/session.json` as 0600, and those two changes

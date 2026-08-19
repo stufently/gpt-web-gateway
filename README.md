@@ -278,7 +278,8 @@ Every endpoint returns a uniform error shape:
 | `MAX_BATCH_N` | Upper bound for `n` in one generation request | `10` |
 | `MAX_UPLOAD_BYTES` | Per-file upload limit for edits/references | `52428800` (50 MB) |
 | `QUEUE_FULL_RETRY_AFTER_SEC` | `Retry-After` when the queue is full | `60` |
-| `RATE_LIMIT_COOLDOWN_MINUTES` | Cooldown after ChatGPT rate-limits the account | `30` |
+| `RATE_LIMIT_COOLDOWN_MINUTES` | Cooldown after ChatGPT rate-limits the account — **reactive**, it arms only once ChatGPT has already refused | `30` |
+| `MIN_JOB_GAP_SEC` | **Proactive** pacing: minimum idle time between one **upstream turn** finishing and the next starting — a batch request of `n` images pays it `n-1` times, not once. Measured from the finish, not the start: a gap measured from the start does nothing when the turn itself runs longer than the gap, and these turns take a minute or more each. Waiting happens inside the queue slot (so a waiting request keeps its place and callers see ordinary `queue_full` backpressure) and beats a heartbeat, so a deliberate pause is not mistaken for a hang. `0` disables pacing. Current state is visible in `GET /v1/images/status` under `pacing` | `60` |
 | `GENERATION_TIMEOUT_SEC` | First wait window for an image | `240` |
 | `GENERATION_RETRY_TIMEOUT_SEC` | Size of one adaptive extension, granted only while the page shows live generation progress (stop button / "creating image") | `90` |
 | `GENERATION_MAX_TIMEOUT_SEC` | Hard ceiling for the whole image wait (first window + all extensions). Keep ≤ your proxy read timeout | `600` |

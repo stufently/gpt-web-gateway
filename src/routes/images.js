@@ -12,6 +12,7 @@ const { parseBool, normalizeThinkingMode, parseThinkingMode, parseWebSearchReque
 const { isValidConversationId } = require('../lib/conversation-read');
 const { createStreamEmitter } = require('../lib/sse-transform');
 const { progress } = require('../progress');
+const { createPacer } = require('../pacer');
 const {
   incRequests, incGenerations, incEdits, incError, classifyError, incQueueFull,
   observeDuration, shouldRetryKind,
@@ -130,16 +131,77 @@ let queue = Promise.resolve();
 let queueSize = 0;
 let rateLimitedUntil = 0; // timestamp when cooldown expires
 
+// Proactive gap between upstream turns. RATE_LIMIT_COOLDOWN_MS above is the
+// reactive half — it arms after ChatGPT refuses; this one keeps us from getting
+// there. Details and the reasoning live in src/pacer.js.
+//
+// The heartbeat is what makes a deliberate pause legible to the liveness
+// detector: a waiting job holds a queue slot, and without a touch the detector
+// would read "queued work, no progress" and restart the container.
+const pacer = createPacer({ heartbeat: () => progress.touch() });
+
+// A cooldown armed while this job was already in line must still stop it.
+// checkRateLimit() runs before enqueue() and nothing re-checked afterwards, so
+// after ChatGPT refused, every job already accepted marched on with a 60s gap
+// instead of the 30-minute cooldown — precisely the traffic the cooldown
+// exists to stop. Found by codex.
+function assertNotRateLimited() {
+  const remainingMs = rateLimitedUntil - Date.now();
+  if (remainingMs <= 0) return;
+  const err = new Error(
+    `ChatGPT rate limit is in effect for another ${Math.ceil(remainingMs / 1000)}s — not sending`,
+  );
+  err.code = 'rate_limit';
+  // This refusal is ours, not ChatGPT's — see handleRateLimitError().
+  err.armsCooldown = false;
+  throw err;
+}
+
+// One upstream turn: refuse outright if a cooldown is already armed, otherwise
+// wait out the gap, re-check (one may have been armed while we waited), then
+// send — and stamp the finish whatever happened. The check runs on both sides
+// of the wait on purpose: sitting out 60s only to refuse afterwards makes the
+// caller pay for a send that was never going to happen. Found by agy.
+async function upstreamTurn(send) {
+  assertNotRateLimited();
+  const waited = await pacer.gate();
+  if (waited > 0) console.log(`[pacer] waited ${Math.round(waited / 1000)}s before an upstream turn`);
+  assertNotRateLimited();
+  try {
+    return await send();
+  } finally {
+    pacer.finished();
+  }
+}
+
 function enqueue(fn) {
   queueSize++;
   progress.jobStarted();
   // Exactly-once liveness accounting per job: success → streak reset; error → classified
   // kind feeds the consecutive-infra-failure detector (see src/progress.js).
-  const wrapped = () => fn().then(
-    (v) => { progress.jobFinished(null); return v; },
-    (err) => { progress.jobFinished(classifyError(err.message, err.code)); throw err; },
-  ).finally(() => { queueSize--; });
-  const p = queue.then(wrapped, wrapped);
+  //
+  // The pacing gate sits INSIDE the queue slot, after the previous job released
+  // it: the job keeps its place in line while waiting, so callers see ordinary
+  // queue backpressure and never a silent reordering. pacer.finished() runs in
+  // finally, because a refused or timed-out request reached ChatGPT exactly as
+  // a successful one did — pacing is about the account, not our success rate.
+  // fn() paces its own upstream turns through upstreamTurn(), so enqueue does
+  // NOT gate here: a job that sends nothing (or is abandoned before it sends)
+  // should not burn a gap, and a job that sends ten times needs ten gaps, not
+  // one. Everything the queue owes the liveness detector stays here, inside the
+  // try — a gate that rejected outside it would have left the job counted as
+  // started and never finished.
+  const wrapped = async () => {
+    try {
+      const value = await fn();
+      progress.jobFinished(null);
+      return value;
+    } catch (err) {
+      progress.jobFinished(classifyError(err.message, err.code));
+      throw err;
+    }
+  };
+  const p = queue.then(wrapped, wrapped).finally(() => { queueSize--; });
   queue = p.catch(() => {});
   return p;
 }
@@ -165,9 +227,23 @@ function checkRateLimit(res, startedAt) {
   return false;
 }
 
+// How long a client turned away for a full queue should wait. The queued jobs
+// themselves PLUS the pacing gap before each of them: quoting the bare
+// QUEUE_FULL_RETRY_AFTER once pacing is on sends the client back too early, it
+// gets 429 again, and every such probe is another request against the account
+// this limit exists to protect. Found by agy.
+//
+// It is an ESTIMATE and cannot be better than one here: a queued batch owes a
+// gap per image, not per job, and only the running job knows how many turns it
+// has left. It errs low for batches and high for single turns; Math.ceil keeps
+// it a whole number of seconds, which is all Retry-After may carry. Found by codex.
+function queueFullRetryAfterSec(queued) {
+  return Math.ceil(QUEUE_FULL_RETRY_AFTER + queued * pacer.status().min_gap_sec);
+}
+
 function checkQueueFull(res, startedAt) {
   if (queueSize >= MAX_QUEUE_SIZE) {
-    const retryAfterSec = QUEUE_FULL_RETRY_AFTER;
+    const retryAfterSec = queueFullRetryAfterSec(queueSize);
     incQueueFull();
     observeDuration('queue_full', elapsedSec(startedAt));
     res.set('Retry-After', String(retryAfterSec));
@@ -260,6 +336,12 @@ function parseResetTime(message) {
 }
 
 function handleRateLimitError(err) {
+  // A refusal WE raised because a cooldown is already running never reached
+  // ChatGPT, and its message says "rate limit" — which this function matches on.
+  // Arming for it would push the deadline out by another full cooldown FROM NOW,
+  // so a client that keeps retrying would hold its own service shut indefinitely,
+  // logging a limit ChatGPT never sent each time. Found by codex.
+  if (err.armsCooldown === false) return;
   if (err.message && err.message.includes('rate limit')) {
     const parsedMs = parseResetTime(err.message);
     const cooldownMs = parsedMs || RATE_LIMIT_COOLDOWN_MS;
@@ -427,13 +509,13 @@ router.post('/v1/images/generations', maybeMultipartGen, async (req, res) => {
       const out = [];
       for (let i = 0; i < n; i++) {
         try {
-          const result = await generateImage(prompt, {
+          const result = await upstreamTurn(() => generateImage(prompt, {
             thinkingMode,
             aspectRatio,
             quality,
             references: i === 0 ? references : [],
             reuseChat: i > 0,
-          });
+          }));
           progress.touch(); // per-image heartbeat — long legit batches must not look stuck
           if (i === 0 && result.applied) firstApplied = result.applied;
           if (result.applied) turnTiers.push(result.applied);
@@ -457,6 +539,10 @@ router.post('/v1/images/generations', maybeMultipartGen, async (req, res) => {
           // every already-saved image (disk leak + lost results). Now we record the
           // error per-turn and continue, returning `partial: true` if some succeeded.
           console.error(`[batch ${i + 1}/${n}] failed:`, turnErr.message);
+          // A rate limit on turn 2+ used to be swallowed as a partial batch:
+          // respondWithError() never ran, so the cooldown never armed and the
+          // next request walked straight back into the same wall. Found by codex.
+          handleRateLimitError(turnErr);
           errors.push({ index: i, message: turnErr.message, kind: classifyError(turnErr.message, turnErr.code) });
           // If the FIRST turn fails, abort entirely — same chat is unusable
           if (i === 0) throw turnErr;
@@ -636,12 +722,12 @@ router.post('/v1/images/edits', maybeMultipart, async (req, res) => {
   const host = `${req.protocol}://${req.get('host')}`;
 
   try {
-    const result = await enqueue(() => editImage(prompt, imageInput, {
+    const result = await enqueue(() => upstreamTurn(() => editImage(prompt, imageInput, {
       thinkingMode,
       aspectRatio,
       quality,
       references,
-    }));
+    })));
 
     let data;
     if (response_format === 'b64_json') {
@@ -788,10 +874,10 @@ async function handleTextCompletion(req, res, prompt) {
   }
 
   try {
-    const result = await enqueue(() => completeText(prompt, {
+    const result = await enqueue(() => upstreamTurn(() => completeText(prompt, {
       thinkingMode,
       conversationId,
-    }));
+    })));
 
     const applied = result.applied || { thinking: false, thinking_mode: 'instant' };
     progress.clearPartialInfra(); // any full success proves the session alive
@@ -882,7 +968,7 @@ async function streamTextCompletion(res, prompt, { thinkingMode, webSearch, conv
   };
 
   try {
-    const result = await enqueue(() => completeText(prompt, {
+    const result = await enqueue(() => upstreamTurn(() => completeText(prompt, {
       thinkingMode,
       conversationId,
       // Called with the latest FULL text; the emitter turns it into append-only deltas.
@@ -892,7 +978,7 @@ async function streamTextCompletion(res, prompt, { thinkingMode, webSearch, conv
           for (const chunk of emitter.push(fullText)) res.write(chunk);
         } catch {}
       },
-    }));
+    })));
 
     ensureStreamStarted();
     for (const chunk of emitter.finish(result.text, {
@@ -980,6 +1066,9 @@ router.get('/v1/images/status', (req, res) => {
     status: rateLimited ? 'rate_limited' : 'ok',
     queue_size: queueSize,
     max_queue_size: MAX_QUEUE_SIZE,
+    // An invisible limit reads as a broken service: without this the caller
+    // only sees response times growing and concludes the gateway is wedged.
+    pacing: pacer.status(),
     max_batch_n: MAX_BATCH_N,
     batch_metric: totalGenerationsByN,
     ...(rateLimited && {
@@ -1050,3 +1139,15 @@ router.get('/v1/images/capabilities', async (req, res) => {
 });
 
 module.exports = router;
+
+// Test-only surface for scripts/test-cooldown.js. The cooldown deadline and the
+// queue-full estimate are module state, and the pacing release shipped a defect
+// in exactly that state (a local refusal re-arming the cooldown) which unit tests
+// on pacer.js alone could not see. Nothing in the service reads this.
+module.exports._internals = {
+  assertNotRateLimited,
+  handleRateLimitError,
+  queueFullRetryAfterSec,
+  getRateLimitedUntil: () => rateLimitedUntil,
+  setRateLimitedUntil: (value) => { rateLimitedUntil = value; },
+};
