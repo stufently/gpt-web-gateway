@@ -1,6 +1,6 @@
 {
   "name": "gpt-web-gateway",
-  "version": "2.14.0",
+  "version": "2.14.1",
   "description": "OpenAI-compatible API gateway backed by the ChatGPT.com web UI (Playwright + stealth): chat completions, thinking modes, image generation/edit",
   "main": "src/server.js",
   "scripts": {

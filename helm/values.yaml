@@ -12,6 +12,11 @@ service:
   port: 3000
 
 env:
+  # Minimum idle stretch between two upstream turns. The 60s default was not
+  # enough on this account: ChatGPT went on interrupting the owner's own
+  # interactive session while the batch pipeline ran, so the operator raised it.
+  # Every queued caller pays it, and a long batch run is exactly what it slows.
+  MIN_JOB_GAP_SEC: "120"
   # Headful by default. Cloudflare treats a headless build as an untrusted browser regardless
   # of JS-level evasions, and the patchright engine's supported (and measured-passing)
   # configuration is real Chrome, headed. The image runs it under Xvfb, so no display is needed.

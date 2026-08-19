@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.14.1 — the gap goes to 120s on this deployment (2026-08-19)
+
+60s was measured, not guessed — and measured insufficient. With a batch pipeline running against
+the same account, ChatGPT kept interrupting the owner's own interactive session, which is the
+exact harm 2.14.0 set out to prevent. `MIN_JOB_GAP_SEC` is now set to **120** in the chart's
+values rather than in code: the shipped default stays 60 for anyone else, and this is a property
+of one busy account, not of the software.
+
+Chart `env` wins over the `envFrom` Secret for the same key, so this overrides any value synced
+from elsewhere. Verify what is actually in force with `GET /v1/images/status` → `pacing.min_gap_sec`;
+the setting is worth nothing if the running pod disagrees with the file.
+
 ## 2.14.0 — proactive pacing between jobs (2026-08-19)
 
 Rate limiting had only its reactive half. `RATE_LIMIT_COOLDOWN_MINUTES` arms **after** ChatGPT
