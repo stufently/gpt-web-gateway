@@ -469,11 +469,26 @@ async function saveSession() {
   // 0700 / 0600: this file is the live ChatGPT session — cookies that are, in
   // practice, the account. Default permissions would leave it world-readable,
   // which matters as soon as the volume is shared or the image runs multi-user.
-  // `mode` only applies on create, so chmod unconditionally for files written
-  // by an earlier version.
   fs.mkdirSync(path.dirname(SESSION_PATH), { recursive: true, mode: 0o700 });
   fs.writeFileSync(SESSION_PATH, JSON.stringify(state, null, 2), { mode: 0o600 });
-  fs.chmodSync(SESSION_PATH, 0o600);
+  // `mode` above only applies when the file is CREATED, so an existing file keeps
+  // whatever mode it had — hence the repair chmod. It is best-effort on purpose:
+  // upgrading a pre-2.13.0 deployment leaves a session.json owned by root (the
+  // image ran as root until then), and chmod on a file you do not own is EPERM
+  // even when fsGroup has made it group-writable. That is a tightening we cannot
+  // perform, not a reason to fail the request — the session itself was just saved.
+  try {
+    fs.chmodSync(SESSION_PATH, 0o600);
+  } catch (err) {
+    if (!saveSession.warnedChmod) {
+      saveSession.warnedChmod = true;
+      console.warn(
+        `[session] could not tighten ${SESSION_PATH} to 0600 (${err.code}) — likely a file ` +
+        'left by a pre-2.13.0 root container. Delete it once so it is recreated 0600, or ' +
+        'chown it to uid 1000.'
+      );
+    }
+  }
 }
 
 async function closeBrowser() {

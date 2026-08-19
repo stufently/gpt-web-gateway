@@ -1,5 +1,5 @@
 apiVersion: v2
 name: gpt-web-gateway
 description: OpenAI-compatible API gateway backed by the ChatGPT.com web UI
-version: 2.13.0
-appVersion: "2.13.0"
+version: 2.13.1
+appVersion: "2.13.1"

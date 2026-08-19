@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.13.1 — the 0600 repair could not run on an upgraded volume (2026-08-19)
+
+2.13.0 both dropped root and started writing `auth/session.json` as 0600, and those two changes
+collided on exactly the deployments the release was aimed at. `writeFileSync`'s `mode` applies
+only when a file is created, so an existing session needed a repair `chmod` — but after the
+switch to `USER node`, that file is still owned by whoever wrote it under the old root image.
+`chmod` on a file you do not own is `EPERM` even when `fsGroup` has made it group-writable, so
+every save threw and the request came back `500 EPERM: operation not permitted, chmod
+'/app/auth/session.json'`. Measured in production immediately after the upgrade; it did not
+show up in pre-release testing because a fresh container creates the file itself and owns it.
+
+The repair is now best-effort and warns once instead of failing: the session has already been
+saved by the time it runs, and a permission we cannot tighten is not a reason to fail the call.
+
+To actually get 0600 on an upgraded volume, reissue the file as the runtime user — the mount
+directory is group-writable, so this needs no root:
+
+    cd /app/auth && cp session.json .new && chmod 600 .new && mv .new session.json
+
 ## 2.13.0 — pre-publication security pass (2026-08-19)
 
 Audit of the whole repository ahead of making it public. No credential, cookie or session file
