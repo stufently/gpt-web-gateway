@@ -1,0 +1,8 @@
+node_modules/
+tmp/
+.env
+auth/
+public/images/*
+!public/images/.gitkeep
+.claude/
+scratch/

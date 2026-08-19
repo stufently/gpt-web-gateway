@@ -1,0 +1,9 @@
+node_modules
+auth
+.env
+public/images
+.git
+.github
+helm
+scratch
+*.md

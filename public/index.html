@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GPT Web Gateway</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; }
+    .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+    h1 { text-align: center; margin: 20px 0; font-size: 24px; color: #a78bfa; }
+    .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+    .tab { flex: 1; padding: 12px; text-align: center; background: #16213e; border: 1px solid #333; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
+    .tab.active { background: #a78bfa; color: #000; border-color: #a78bfa; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; margin-bottom: 6px; font-size: 14px; color: #aaa; }
+    input[type="text"], textarea, select { width: 100%; padding: 12px; background: #16213e; border: 1px solid #333; border-radius: 8px; color: #eee; font-size: 14px; resize: vertical; }
+    textarea { min-height: 80px; }
+    input[type="text"]:focus, textarea:focus, select:focus { outline: none; border-color: #a78bfa; }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; }
+    .check { display: flex; gap: 8px; align-items: center; min-height: 44px; color: #ccc; font-size: 14px; white-space: nowrap; }
+    .check input { width: 16px; height: 16px; }
+    .upload-area { border: 2px dashed #333; border-radius: 12px; padding: 40px; text-align: center; cursor: pointer; transition: all 0.2s; position: relative; }
+    .upload-area:hover { border-color: #a78bfa; background: rgba(167, 139, 250, 0.05); }
+    .upload-area.has-image { padding: 10px; }
+    .upload-area img { max-width: 100%; max-height: 400px; border-radius: 8px; }
+    .upload-area input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+    .upload-text { color: #666; }
+    button.submit { width: 100%; padding: 14px; background: #a78bfa; color: #000; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+    button.submit:hover { background: #8b5cf6; }
+    button.submit:disabled { background: #444; color: #888; cursor: not-allowed; }
+    .result { margin-top: 20px; text-align: center; }
+    .result img { max-width: 100%; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
+    .result a { display: inline-block; margin-top: 10px; color: #a78bfa; text-decoration: none; }
+    .result.text { text-align: left; white-space: pre-wrap; padding: 16px; background: #16213e; border: 1px solid #333; border-radius: 8px; line-height: 1.5; }
+    .loading { display: none; text-align: center; padding: 40px; }
+    .loading.active { display: block; }
+    .spinner { width: 40px; height: 40px; border: 3px solid #333; border-top-color: #a78bfa; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error { color: #f87171; text-align: center; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>GPT Web Gateway</h1>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="generate">Генерация</div>
+      <div class="tab" data-tab="edit">Редактирование</div>
+      <div class="tab" data-tab="chat">Текст</div>
+    </div>
+
+    <div class="row">
+      <div class="form-group">
+        <label>Режим</label>
+        <select id="thinking-mode">
+          <option value="instant">Instant</option>
+          <option value="standard">Thinking standard</option>
+          <option value="extended">Thinking extended (High)</option>
+          <option value="extra_high">Extra High</option>
+          <option value="pro">Pro</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Generate panel -->
+    <div class="panel active" id="panel-generate">
+      <div class="form-group">
+        <label>Промпт</label>
+        <textarea id="gen-prompt" placeholder="a cute cat in space, digital art"></textarea>
+      </div>
+      <button class="submit" id="gen-btn">Сгенерировать</button>
+    </div>
+
+    <!-- Edit panel -->
+    <div class="panel" id="panel-edit">
+      <div class="form-group">
+        <label>Загрузите изображение</label>
+        <div class="upload-area" id="upload-area">
+          <input type="file" id="file-input" accept="image/*">
+          <div class="upload-text" id="upload-text">Нажмите или перетащите изображение</div>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Что изменить</label>
+        <textarea id="edit-prompt" placeholder="Make the background a sunset beach"></textarea>
+      </div>
+      <button class="submit" id="edit-btn">Изменить</button>
+    </div>
+
+    <!-- Chat panel -->
+    <div class="panel" id="panel-chat">
+      <div class="form-group">
+        <label>Вопрос</label>
+        <textarea id="chat-prompt" placeholder="Разбери вопрос, проверь актуальные данные и дай вывод"></textarea>
+      </div>
+      <button class="submit" id="chat-btn">Спросить</button>
+    </div>
+
+    <div class="loading" id="loading">
+      <div class="spinner"></div>
+      <div id="loading-text">Запрос выполняется...</div>
+    </div>
+
+    <div class="error" id="error"></div>
+
+    <div class="result" id="result"></div>
+  </div>
+
+  <script>
+    // Tabs
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
+      });
+    });
+
+    // File upload preview
+    const fileInput = document.getElementById('file-input');
+    const uploadArea = document.getElementById('upload-area');
+    const uploadText = document.getElementById('upload-text');
+    let uploadedFile = null;
+
+    fileInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      uploadedFile = file;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        uploadArea.classList.add('has-image');
+        const preview = document.createElement('img');
+        preview.src = ev.target.result;
+        uploadText.replaceChildren(preview);
+      };
+      reader.readAsDataURL(file);
+    });
+
+    // Generate
+    document.getElementById('gen-btn').addEventListener('click', async () => {
+      const prompt = document.getElementById('gen-prompt').value.trim();
+      if (!prompt) return;
+      await callGenerate(prompt);
+    });
+
+    // Edit
+    document.getElementById('edit-btn').addEventListener('click', async () => {
+      const prompt = document.getElementById('edit-prompt').value.trim();
+      if (!prompt || !uploadedFile) {
+        document.getElementById('error').textContent = 'Загрузите изображение и введите промпт';
+        return;
+      }
+      await callEdit(prompt, uploadedFile);
+    });
+
+    document.getElementById('chat-btn').addEventListener('click', async () => {
+      const prompt = document.getElementById('chat-prompt').value.trim();
+      if (!prompt) return;
+      await callChat(prompt);
+    });
+
+    function commonOptions() {
+      return {
+        thinking_mode: document.getElementById('thinking-mode').value,
+      };
+    }
+
+    async function callGenerate(prompt) {
+      return callAPI('/v1/images/generations', {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, ...commonOptions() }),
+      }, 'image');
+    }
+
+    async function callEdit(prompt, file) {
+      const fd = new FormData();
+      fd.append('prompt', prompt);
+      fd.append('thinking_mode', commonOptions().thinking_mode);
+      fd.append('image', file, file.name);
+      // Don't set Content-Type — browser sets it with boundary automatically
+      return callAPI('/v1/images/edits', { body: fd }, 'image');
+    }
+
+    async function callChat(prompt) {
+      return callAPI('/v1/chat/completions', {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: prompt }],
+          ...commonOptions(),
+        }),
+      }, 'text');
+    }
+
+    async function callAPI(endpoint, fetchOpts, type) {
+      const loading = document.getElementById('loading');
+      const loadingText = document.getElementById('loading-text');
+      const result = document.getElementById('result');
+      const error = document.getElementById('error');
+
+      loading.classList.add('active');
+      loadingText.textContent = type === 'text'
+        ? 'ChatGPT думает... Это может занять несколько минут'
+        : 'Генерация изображения... Может занять до 2 минут';
+      result.innerHTML = '';
+      result.classList.remove('text');
+      error.textContent = '';
+
+      document.querySelectorAll('.submit').forEach(b => b.disabled = true);
+
+      try {
+        const res = await fetch(endpoint, { method: 'POST', ...fetchOpts });
+        const data = await res.json();
+
+        if (data.error) {
+          error.textContent = data.error.message;
+          return;
+        }
+
+        if (type === 'text') {
+          const text = data.choices[0].message.content;
+          result.classList.add('text');
+          result.textContent = text;
+        } else {
+          // Built as DOM nodes, not interpolated markup: the URL is assembled
+          // server-side from the request's Host header, so a spoofed Host would
+          // otherwise be injected straight into this page.
+          const url = data.data[0].url;
+          const img = document.createElement('img');
+          img.src = url;
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = '';
+          link.textContent = 'Скачать';
+          result.replaceChildren(img, document.createElement('br'), link);
+        }
+      } catch (e) {
+        error.textContent = 'Ошибка: ' + e.message;
+      } finally {
+        loading.classList.remove('active');
+        document.querySelectorAll('.submit').forEach(b => b.disabled = false);
+      }
+    }
+  </script>
+</body>
+</html>

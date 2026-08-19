@@ -1,0 +1,118 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/OWNER/gpt-web-gateway
+  tag: ""
+  pullPolicy: Always
+
+imagePullSecrets: []
+
+service:
+  type: ClusterIP
+  port: 3000
+
+env:
+  # Headful by default. Cloudflare treats a headless build as an untrusted browser regardless
+  # of JS-level evasions, and the patchright engine's supported (and measured-passing)
+  # configuration is real Chrome, headed. The image runs it under Xvfb, so no display is needed.
+  HEADLESS: "false"
+  PORT: "3000"
+  # Browser engine (2.11.0+). Default "patchright" = patched Playwright fork + real Google
+  # Chrome, the coherent-fingerprint stack. "stealth" restores the legacy playwright-extra +
+  # puppeteer-extra-plugin-stealth path — both browsers ship in the image, so rolling back
+  # needs no rebuild. NB: an explicit CHROMIUM_CHANNEL overrides the engine's own default
+  # (patchright defaults to "chrome"; setting "chromium" selects a configuration measured
+  # at 403 against chatgpt.com).
+  #   BROWSER_ENGINE: "stealth"
+  #   CHROMIUM_CHANNEL: "chromium"
+  #
+  # Anti-bot / egress knobs (all optional, see README and
+  # docs/2026-07-26-cloudflare-block-fingerprint-vs-egress.md):
+  #
+  #   PROXY_SERVER: "http://proxy.example.com:8888"
+  #     Route the browser out through another address. This is the fix for a Cloudflare
+  #     challenge that no fingerprint change clears — a distrusted egress IP is answered
+  #     403 `cf-mitigated: challenge` whatever the browser claims to be. Put
+  #     PROXY_USERNAME / PROXY_PASSWORD in the envFrom Secret below, never here.
+  #
+  #   CHROMIUM_CHANNEL: "chromium"
+  #     Swap the bundled headless shell for the full Chromium build (new headless).
+  #     Costs roughly twice the browser memory (~722 MB vs ~377 MB idle, measured) —
+  #     raise `resources.limits.memory` before enabling it.
+  #
+  #   BROWSER_USER_AGENT: "…"
+  #     Pin the UA. Normally leave unset: the browser's own (stealth-normalised) UA is
+  #     self-consistent, and a pin that disagrees with the platform is an anti-bot signal.
+
+# Name of an existing Secret consumed via envFrom (optional; e.g. synced from
+# Vault). Override when the Secret in the cluster has a different name.
+envSecretName: gpt-web-gateway-env
+
+# Pod-level security context. `fsGroup` is load-bearing, not decoration: the image runs as
+# uid/gid 1000 (see the Dockerfile's USER), and without fsGroup the RWO PVCs mounted at
+# /app/auth and /app/public/images arrive owned by root and the process cannot write the
+# ChatGPT session back.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level. Note `allowPrivilegeEscalation: false` is safe here only because Chromium's
+# setuid sandbox is already disabled (Playwright's default) — the browser never needs to gain
+# privileges. A read-only root filesystem is NOT set: the browser writes profile and crash
+# data all over /tmp and its own cache.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""
+
+ingress:
+  host: gpt-web-gateway.example.com
+
+auth:
+  enabled: true
+  # Generate with: htpasswd -nb user password
+  htpasswd: ""
+  # Name of an existing Secret with an `auth` key (a ready htpasswd line), e.g.
+  # synced from Vault. When set, the chart does NOT render its own Secret and the
+  # ingress auth-secret annotation points at this Secret instead.
+  # Rollback caution: reverting to a chart version without existingSecret while
+  # htpasswd is empty renders an empty auth file -> nginx denies ALL requests.
+  existingSecret: ""
+
+# Chromium is the memory consumer here: ~1.7 GiB peak observed over 48 h of light
+# production traffic, so a 2 Gi limit leaves almost no headroom for a long batch.
+resources:
+  limits:
+    cpu: "1"
+    memory: 3Gi
+  requests:
+    cpu: 500m
+    memory: 1Gi
+
+# Restarts the pod when the browser layer is wedged (stuck-detector /
+# failure-streak) — see /health/live in the app.
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 3000
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  timeoutSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5

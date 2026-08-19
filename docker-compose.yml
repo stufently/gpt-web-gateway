@@ -1,0 +1,29 @@
+services:
+  gpt-web-gateway:
+    build: .
+    image: gpt-web-gateway
+    container_name: gpt-web-gateway
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      # Headful (under Xvfb inside the image) — the configuration Cloudflare accepts.
+      HEADLESS: "false"
+      # BROWSER_ENGINE: "stealth"   # roll back to the pre-2.11.0 stealth stack
+      PORT: "3000"
+      # --- Advanced (see README "Advanced features"; verified live 2026-07-18) ---
+      # Backend-api answer reading is ON by default (set "0" for DOM-only):
+      # READ_VIA_BACKEND_API: "0"
+      # Trim long conversations to the last N messages when reopening them:
+      # CONVERSATION_TRIM_LIMIT: "20"
+      # Disable ChatGPT account memory once at session start (best-effort):
+      # DISABLE_CHATGPT_MEMORY: "1"
+    volumes:
+      # ChatGPT session state (cookies) — keep this volume private
+      - ./auth:/app/auth
+      # Generated images served at /images/<id>.<ext>
+      - ./public/images:/app/public/images
+    # Chromium needs a bigger shared memory segment than the Docker default
+    shm_size: "1gb"
