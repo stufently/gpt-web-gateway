@@ -21,7 +21,9 @@ ns/сервис `gpt-web-gateway`, URL `https://gpt-web-gateway.example.com`). �
 - **Скилл — реальные файлы в `~/.claude/skills/chatgpt-web/`** (standalone, с 2026-07-19 после
   удаления старого репо `chatgpt-web-image-api`; раньше был симлинк в `skill/` того репо).
   `~/.claude/rules/chatgpt-web.md` → `~/.claude/skills/chatgpt-web/rules.md`.
-  API-сервис теперь `github.com/stufently/gpt-web-gateway` (skill-обёртки НЕ в том репо — план опенсорса).
+  API-сервис — `github.com/stufently/gpt-web-gateway`, с 2026-08-19 публичный (MIT).
+  Эти обёртки лежат в нём же, в `clients/chatgpt-web-skill/`. Хост в примерах —
+  плейсхолдер `gpt-web-gateway.example.com`: свой адрес держи в `.env`, не в файлах скила.
 - Скрипт картинок: `~/.claude/skills/chatgpt-web/generate.sh`
 - Python helper для edits: `~/.claude/skills/chatgpt-web/edit_image.py`
 - Скрипт текстового чата: `~/.claude/skills/chatgpt-web/chat.sh`
