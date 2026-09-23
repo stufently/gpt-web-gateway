@@ -236,7 +236,7 @@ download_to() {
                 magick "$tmp" -quality 90 -strip "$out" 2>/dev/null
             elif command -v docker >/dev/null 2>&1; then
                 local tdir odir; tdir=$(dirname "$tmp"); odir=$(cd "$(dirname "$out")" && pwd)
-                docker run --rm --entrypoint="" -v "$tdir:$tdir" -v "$odir:/outdir" dpokidov/imagemagick \
+                docker run --rm --user "$(id -u):$(id -g)" --entrypoint="" -v "$tdir:$tdir" -v "$odir:/outdir" dpokidov/imagemagick \
                     convert "$tmp" -quality 90 -strip "/outdir/$(basename "$out")" 2>/dev/null \
                     || cp "$tmp" "$out"
             else
