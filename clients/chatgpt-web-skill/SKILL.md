@@ -20,7 +20,9 @@ ns/сервис `gpt-web-gateway`, URL `https://gpt-web-gateway.example.com`). �
 
 - **Скилл — реальные файлы в `~/.claude/skills/chatgpt-web/`** (standalone, с 2026-07-19 после
   удаления старого репо `chatgpt-web-image-api`; раньше был симлинк в `skill/` того репо).
-  `~/.claude/rules/chatgpt-web.md` → `~/.claude/skills/chatgpt-web/rules.md`.
+  Полный справочник (флаги, тиры thinking, коды ошибок, curl) — `rules.md` рядом;
+  читать по надобности. С 2026-09-24 он НЕ грузится в каждую сессию: симлинк
+  `~/.claude/rules/chatgpt-web.md` снят, в `~/.claude/CLAUDE.md` — указатель на скил.
   API-сервис — `github.com/stufently/gpt-web-gateway`, с 2026-08-19 публичный (MIT).
   Эти обёртки лежат в нём же, в `clients/chatgpt-web-skill/`. Хост в примерах —
   плейсхолдер `gpt-web-gateway.example.com`: свой адрес держи в `.env`, не в файлах скила.
@@ -269,7 +271,7 @@ fi
 |---|---|
 | `~/.claude/skills/chatgpt-image/generate.sh` | `~/.claude/skills/chatgpt-web/generate.sh` |
 | `~/.claude/skills/chatgpt-image/edit_image.py` | `~/.claude/skills/chatgpt-web/edit_image.py` |
-| `~/.claude/rules/chatgpt-image.md` | `~/.claude/rules/chatgpt-web.md` |
+| `~/.claude/rules/chatgpt-image.md` | `~/.claude/rules/chatgpt-web.md` (снят 2026-09-24, теперь `skills/chatgpt-web/rules.md`) |
 | env `CHATGPT_IMAGE_URL/USER/PASS` | env `CHATGPT_WEB_URL/USER/PASS` |
 | (нет text-чата) | `~/.claude/skills/chatgpt-web/chat.sh` |
 | картинки default = `--thinking` (false) | картинки default явно `instant` (как было), но явный mapping `thinking_mode` |
