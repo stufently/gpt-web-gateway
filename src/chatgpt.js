@@ -1505,7 +1505,11 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
 
   // Adaptive deadline: starts at the base budget and is extended once if ChatGPT is
   // still actively generating when it elapses (stop-button visible at the boundary).
-  let deadline = start + CHAT_COMPLETION_TIMEOUT_MS;
+  const baseBudgetMs = responseBaseBudgetMs(options.inputMs);
+  if (baseBudgetMs < CHAT_COMPLETION_TIMEOUT_MS) {
+    console.log(`[chat] slow prompt input (${Math.round(options.inputMs / 1000)}s) — response base window ${Math.round(baseBudgetMs / 1000)}s`);
+  }
+  let deadline = start + baseBudgetMs;
   let extended = false;
   const STOP_BTN_SELECTOR = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Остановить"]';
 
@@ -2316,6 +2320,20 @@ function fillTimeoutMs(text) {
   const extra = (text ? text.length : 0) * FILL_MS_PER_CHAR;
   return Math.min(FILL_BASE_TIMEOUT_MS + extra, FILL_MAX_TIMEOUT_MS);
 }
+// The per-key fallback types at TYPE_DELAY_MS a character, so its honest budget is linear
+// in the text. Past FILL_MAX_TIMEOUT_MS (~9k chars) it cannot finish in any budget a client
+// would wait for — such a prompt fails fast instead of typing for minutes.
+const TYPE_DELAY_MS = 10;
+function typeFallbackTimeoutMs(text) {
+  const budget = FILL_BASE_TIMEOUT_MS + (text ? text.length : 0) * TYPE_DELAY_MS;
+  return budget > FILL_MAX_TIMEOUT_MS ? null : budget;
+}
+// Input time beyond the old flat 30 s comes out of the response wait, so a slow fill of a
+// long prompt does not stretch the request past what clients allowed before 2.14.2.
+function responseBaseBudgetMs(inputMs) {
+  const overrun = Math.max(0, (inputMs || 0) - FILL_BASE_TIMEOUT_MS);
+  return Math.max(CHAT_COMPLETION_TIMEOUT_MS - overrun, 0);
+}
 
 // Type prompt and submit
 // onSubmitted (optional): called the instant the send is CONFIRMED (a new user turn / stop
@@ -2332,6 +2350,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   const hasSystemHint = await p.locator('#prompt-textarea [data-system-hint-type]').count()
     .then((c) => c > 0).catch(() => false);
   const caretEndKey = process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End';
+  const inputStart = Date.now();
   if (preserveAttachments || hasSystemHint) {
     console.log(`Using keyboard type to preserve ${hasSystemHint ? 'composer token' : 'attachments'}...`);
     await textareaLocator.first().click();
@@ -2353,13 +2372,21 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   console.log('Prompt filled:', content ? content.substring(0, 50) + '...' : '(empty)');
 
   if (!content || (probe && !normText(content).includes(probe))) {
+    const typeTimeout = typeFallbackTimeoutMs(text);
+    if (typeTimeout === null) {
+      markSessionDegraded('prompt did not land in the composer');
+      const err = new Error(`Prompt did not land in the composer (${text.length} chars is too long for per-key typing)`);
+      err.code = 'page_load_failed';
+      throw err;
+    }
     console.log('Fill failed, trying pressSequentially...');
     await textareaLocator.first().click();
     await p.keyboard.press(caretEndKey).catch(() => {});
     await p.waitForTimeout(300);
-    await textareaLocator.first().pressSequentially(text, { delay: 10 });
+    await textareaLocator.first().pressSequentially(text, { delay: TYPE_DELAY_MS, timeout: typeTimeout });
     await p.waitForTimeout(500);
   }
+  const inputMs = Date.now() - inputStart;
 
   await p.waitForTimeout(1000);
   await dismissModals(p);
@@ -2434,6 +2461,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   if (onSubmitted) { try { onSubmitted(); } catch {} }
 
   await p.waitForTimeout(2000);
+  return { inputMs };
 }
 
 async function dismissModals(p) {
@@ -3860,7 +3888,7 @@ async function completeText(prompt, options = {}) {
       // Mark submitted at the confirmed-send instant (inside typeAndSubmit), not just on
       // return — a failure in its trailing settle wait must still count as submitted so we
       // never retry into a duplicate send. The post-call assignment is a backstop.
-      await typeAndSubmit(p, prompt, false, () => { submitted = true; });
+      const { inputMs } = await typeAndSubmit(p, prompt, false, () => { submitted = true; });
       submitted = true;
       // Use the APPLIED mode (what the composer really shows), not the requested one — if the
       // UI stayed on a thinking level the reasoning-placeholder guard must stay armed.
@@ -3869,6 +3897,7 @@ async function completeText(prompt, options = {}) {
         capture,
         onDelta,
         prompt,      // subtracted from the tier-limit scan: it is rendered on the page too
+        inputMs,
       });
 
       if (thinkingState.verified) markHealthyCompletion();
@@ -3982,6 +4011,10 @@ module.exports = {
   // stayed green. A page double is enough — the throw happens long before any image work.
   _test: {
     fillTimeoutMs,
+    typeFallbackTimeoutMs,
+    responseBaseBudgetMs,
+    CHAT_COMPLETION_TIMEOUT_MS,
+    waitAndExtractText,
     typeAndSubmit,
     imageOutcomePredicate,
     setThinkingMode,
