@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.14.2 — the composer fill budget scales with prompt length (2026-09-24)
+
+Long text prompts started failing with `locator.fill: Timeout 30000ms exceeded` once a client
+began sending 30-60 KB bodies. The composer was found and editable every time; `fill()` just
+could not finish inside Playwright's default 30 s action timeout. On the same batch the
+prompts that did get through took 9-27 s to fill, so the failures landed at random on the
+larger ones. Each one counted as an infra `timeout`, and a streak of them failed
+`/health/live`, which restarted the pod for nothing: the next long prompt hit the same limit.
+
+`fill()` now gets `30 s + 2 ms per character`, capped at 120 s. Short prompts keep the old
+30 s budget. The cap keeps a truly stuck composer from eating most of a client's ~600 s
+request budget.
+
+Pasting instead of filling was considered and rejected: ChatGPT Web turns a paste over
+roughly 10k characters into a `.txt` attachment, so the model would get the instructions as a
+file and the prompt-landed check would fail.
+
 ## 2.14.1 — the gap goes to 120s on this deployment (2026-08-19)
 
 60s was measured, not guessed — and measured insufficient. With a batch pipeline running against

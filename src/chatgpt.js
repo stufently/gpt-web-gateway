@@ -2304,6 +2304,19 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
   );
 }
 
+// fill() of a long prompt is one ProseMirror transaction, and ChatGPT's composer handlers
+// run over the whole doc: ~30k chars (a 57 KB Cyrillic body) measured at 9-27 s, so
+// Playwright's default 30 s action timeout failed prompts of that size at random
+// (2026-09-24). The budget grows with the text; the cap keeps a wedged composer from
+// eating the client's ~600 s request budget.
+const FILL_BASE_TIMEOUT_MS = 30000;
+const FILL_MS_PER_CHAR = 2;
+const FILL_MAX_TIMEOUT_MS = 120000;
+function fillTimeoutMs(text) {
+  const extra = (text ? text.length : 0) * FILL_MS_PER_CHAR;
+  return Math.min(FILL_BASE_TIMEOUT_MS + extra, FILL_MAX_TIMEOUT_MS);
+}
+
 // Type prompt and submit
 // onSubmitted (optional): called the instant the send is CONFIRMED (a new user turn / stop
 // button appeared), BEFORE the trailing settle wait. Callers use it to mark the prompt as
@@ -2326,7 +2339,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     await p.waitForTimeout(300);
     await p.keyboard.type(text, { delay: 10 });
   } else {
-    await textareaLocator.first().fill(text);
+    await textareaLocator.first().fill(text, { timeout: fillTimeoutMs(text) });
   }
   await p.waitForTimeout(500);
 
@@ -3968,6 +3981,8 @@ module.exports = {
   // regression shipped: it threw for every refusal, and `node --check` plus the whole suite
   // stayed green. A page double is enough — the throw happens long before any image work.
   _test: {
+    fillTimeoutMs,
+    typeAndSubmit,
     imageOutcomePredicate,
     setThinkingMode,
     waitAndExtractImage,
