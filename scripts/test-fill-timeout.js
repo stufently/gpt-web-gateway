@@ -22,7 +22,7 @@ ok('the budget is capped at 120 s', () => {
   assert.strictEqual(fillTimeoutMs('x'.repeat(200000)), 120000);
 });
 
-ok('prompt_too_long is a non-retryable, non-infra 413', () => {
+ok('prompt_too_long is a non-retryable, non-infra error', () => {
   const { classifyError, shouldRetryKind } = require('../src/metrics');
   const { INFRA_ERROR_KINDS } = require('../src/progress');
   assert.strictEqual(classifyError('Prompt cannot be typed around the attachments', 'prompt_too_long'), 'prompt_too_long');
@@ -30,7 +30,7 @@ ok('prompt_too_long is a non-retryable, non-infra 413', () => {
   assert.strictEqual(INFRA_ERROR_KINDS.has('prompt_too_long'), false);
 });
 
-ok('prompt_too_long answers 413 without a retry hint', () => {
+ok('prompt_too_long answers 422 (clients: do not retry) without a retry hint', () => {
   const { respondWithError } = require('../src/routes/images')._internals;
   const res = {
     headers: {}, code: 0, body: null,
@@ -41,7 +41,7 @@ ok('prompt_too_long answers 413 without a retry hint', () => {
   const err = new Error('Prompt cannot be typed around the attachments (20000 chars is too long for per-key typing)');
   err.code = 'prompt_too_long';
   respondWithError(res, Date.now(), err);
-  assert.strictEqual(res.code, 413);
+  assert.strictEqual(res.code, 422);
   assert.strictEqual(res.body.error_kind, 'prompt_too_long');
   assert.strictEqual(res.body.should_retry, false);
 });

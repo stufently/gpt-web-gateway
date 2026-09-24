@@ -286,7 +286,9 @@ function respondWithError(res, startedAt, err) {
     refused: 422,
     policy_violation: 422,
     conversation_not_found: 404,
-    prompt_too_long: 413,
+    // 422, not 413: shipped clients map 422 to "do not retry, change the prompt" (exit 3) and
+    // treat any unknown status as retryable.
+    prompt_too_long: 422,
     login_failed: 503,
     upload_failed: 503,
     // Not 429: that is the global-cooldown path. One tier is out of quota, the service is fine.

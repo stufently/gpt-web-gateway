@@ -17,12 +17,14 @@ Two review findings on 2.14.2, both about what happens around the longer fill bu
   exceeds 120 s (over ~9k chars), the gateway does not start typing and fails at once with
   `server_error`. The text turn deliberately does not retry it: a fresh page would repeat the
   same long input.
-- **New error kind `prompt_too_long` (HTTP 413, `should_retry: false`).** The path that keeps
+- **New error kind `prompt_too_long` (HTTP 422, `should_retry: false`).** The path that keeps
   attachments or a composer token can only type key by key, and had no timeout at all. A
   prompt over ~9k chars there is now refused up front. That outcome depends on the input
   alone, so it is not an infra failure: it does not count toward the `/health/live` failure
   streak and does not tell the client to retry. It shows up as
-  `gpt_web_gateway_errors_total{type="prompt_too_long"}`.
+  `gpt_web_gateway_errors_total{type="prompt_too_long"}`. The status is 422 rather than
+  413 because the bundled clients already map 422 to "do not retry, change the prompt"
+  (exit 3), while they would treat 413 as a generic, retryable error.
 
 ## 2.14.2 — the composer fill budget scales with prompt length (2026-09-24)
 
