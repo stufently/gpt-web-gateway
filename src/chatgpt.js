@@ -2328,6 +2328,13 @@ function typeFallbackTimeoutMs(text) {
   const budget = FILL_BASE_TIMEOUT_MS + (text ? text.length : 0) * TYPE_DELAY_MS;
   return budget > FILL_MAX_TIMEOUT_MS ? null : budget;
 }
+// Not retried (server_error is not transient for text turns): a fresh page would repeat the
+// same long input, so each retry would add up to FILL_MAX_TIMEOUT_MS to the request.
+function tooLongToTypeError(text, why) {
+  const err = new Error(`Prompt ${why} (${text.length} chars is too long for per-key typing)`);
+  err.code = 'server_error';
+  return err;
+}
 // Input time beyond the old flat 30 s comes out of the response wait, so a slow fill of a
 // long prompt does not stretch the request past what clients allowed before 2.14.2.
 function responseBaseBudgetMs(inputMs) {
@@ -2339,7 +2346,9 @@ function responseBaseBudgetMs(inputMs) {
 // onSubmitted (optional): called the instant the send is CONFIRMED (a new user turn / stop
 // button appeared), BEFORE the trailing settle wait. Callers use it to mark the prompt as
 // sent so a failure in the settle window is not retried into a duplicate submission.
-async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted = null) {
+// timing (optional): gets `inputMs` — time spent putting the prompt into the composer — even
+// when the call throws, so a caller retrying the turn can count every attempt's input.
+async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted = null, timing = null) {
   console.log('Typing prompt...');
   await dismissModals(p);
   const textareaLocator = p.locator('#prompt-textarea');
@@ -2351,42 +2360,45 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     .then((c) => c > 0).catch(() => false);
   const caretEndKey = process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End';
   const inputStart = Date.now();
-  if (preserveAttachments || hasSystemHint) {
-    console.log(`Using keyboard type to preserve ${hasSystemHint ? 'composer token' : 'attachments'}...`);
-    await textareaLocator.first().click();
-    await p.keyboard.press(caretEndKey).catch(() => {});
-    await p.waitForTimeout(300);
-    await p.keyboard.type(text, { delay: 10 });
-  } else {
-    await textareaLocator.first().fill(text, { timeout: fillTimeoutMs(text) });
-  }
-  await p.waitForTimeout(500);
-
-  // Verify the PROMPT text landed — not just that the editor is non-empty. With a
-  // system-hint token in the doc, textContent is truthy even if typing silently failed.
-  // Probe with the first line only: ProseMirror textContent concatenates paragraphs
-  // without separators, so multi-line probes would false-negative.
   const normText = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const probe = normText((text || '').split('\n')[0]).slice(0, 30);
-  const content = await textareaLocator.first().textContent();
-  console.log('Prompt filled:', content ? content.substring(0, 50) + '...' : '(empty)');
-
-  if (!content || (probe && !normText(content).includes(probe))) {
-    const typeTimeout = typeFallbackTimeoutMs(text);
-    if (typeTimeout === null) {
-      markSessionDegraded('prompt did not land in the composer');
-      const err = new Error(`Prompt did not land in the composer (${text.length} chars is too long for per-key typing)`);
-      err.code = 'page_load_failed';
-      throw err;
+  try {
+    if (preserveAttachments || hasSystemHint) {
+      // keyboard.type has no timeout of its own: a long prompt here would hold the queue for
+      // as long as typing takes.
+      if (typeFallbackTimeoutMs(text) === null) {
+        throw tooLongToTypeError(text, `cannot be typed around the ${hasSystemHint ? 'composer token' : 'attachments'}`);
+      }
+      console.log(`Using keyboard type to preserve ${hasSystemHint ? 'composer token' : 'attachments'}...`);
+      await textareaLocator.first().click();
+      await p.keyboard.press(caretEndKey).catch(() => {});
+      await p.waitForTimeout(300);
+      await p.keyboard.type(text, { delay: TYPE_DELAY_MS });
+    } else {
+      await textareaLocator.first().fill(text, { timeout: fillTimeoutMs(text) });
     }
-    console.log('Fill failed, trying pressSequentially...');
-    await textareaLocator.first().click();
-    await p.keyboard.press(caretEndKey).catch(() => {});
-    await p.waitForTimeout(300);
-    await textareaLocator.first().pressSequentially(text, { delay: TYPE_DELAY_MS, timeout: typeTimeout });
     await p.waitForTimeout(500);
+
+    // Verify the PROMPT text landed — not just that the editor is non-empty. With a
+    // system-hint token in the doc, textContent is truthy even if typing silently failed.
+    // Probe with the first line only: ProseMirror textContent concatenates paragraphs
+    // without separators, so multi-line probes would false-negative.
+    const content = await textareaLocator.first().textContent();
+    console.log('Prompt filled:', content ? content.substring(0, 50) + '...' : '(empty)');
+
+    if (!content || (probe && !normText(content).includes(probe))) {
+      const typeTimeout = typeFallbackTimeoutMs(text);
+      if (typeTimeout === null) throw tooLongToTypeError(text, 'did not land in the composer');
+      console.log('Fill failed, trying pressSequentially...');
+      await textareaLocator.first().click();
+      await p.keyboard.press(caretEndKey).catch(() => {});
+      await p.waitForTimeout(300);
+      await textareaLocator.first().pressSequentially(text, { delay: TYPE_DELAY_MS, timeout: typeTimeout });
+      await p.waitForTimeout(500);
+    }
+  } finally {
+    if (timing) timing.inputMs = Date.now() - inputStart;
   }
-  const inputMs = Date.now() - inputStart;
 
   await p.waitForTimeout(1000);
   await dismissModals(p);
@@ -2461,7 +2473,6 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   if (onSubmitted) { try { onSubmitted(); } catch {} }
 
   await p.waitForTimeout(2000);
-  return { inputMs };
 }
 
 async function dismissModals(p) {
@@ -3853,6 +3864,8 @@ async function completeText(prompt, options = {}) {
   const onDelta = options.onDelta
     ? (fullText) => { anyDeltaEmitted = true; options.onDelta(fullText); }
     : undefined;
+  // Input time across ALL attempts — a retried turn already spent it once.
+  let inputSpentMs = 0;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // Becomes true once THIS attempt has actually sent the prompt. A logout/navigation error
     // AFTER submit must not retry — a fresh chat would re-send the same prompt (duplicate
@@ -3888,7 +3901,12 @@ async function completeText(prompt, options = {}) {
       // Mark submitted at the confirmed-send instant (inside typeAndSubmit), not just on
       // return — a failure in its trailing settle wait must still count as submitted so we
       // never retry into a duplicate send. The post-call assignment is a backstop.
-      const { inputMs } = await typeAndSubmit(p, prompt, false, () => { submitted = true; });
+      const timing = {};
+      try {
+        await typeAndSubmit(p, prompt, false, () => { submitted = true; }, timing);
+      } finally {
+        inputSpentMs += timing.inputMs || 0;
+      }
       submitted = true;
       // Use the APPLIED mode (what the composer really shows), not the requested one — if the
       // UI stayed on a thinking level the reasoning-placeholder guard must stay armed.
@@ -3897,7 +3915,7 @@ async function completeText(prompt, options = {}) {
         capture,
         onDelta,
         prompt,      // subtracted from the tier-limit scan: it is rendered on the page too
-        inputMs,
+        inputMs: inputSpentMs, // every attempt's input, not just this one's
       });
 
       if (thinkingState.verified) markHealthyCompletion();

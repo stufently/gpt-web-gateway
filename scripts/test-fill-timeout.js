@@ -47,7 +47,7 @@ ok('input beyond 30 s comes out of the response window', () => {
 // composer; `pressSeq` records the per-key fallback; user turns grow on click so the submit
 // is confirmed and the whole function runs to its return.
 function pageDouble({ landed, fillDelayMs = 0 }) {
-  const calls = { pressSeq: null };
+  const calls = { pressSeq: null, keyboardType: null };
   let content = '';
   let turns = 0;
   const locator = {
@@ -63,7 +63,7 @@ function pageDouble({ landed, fillDelayMs = 0 }) {
     evaluate: async (fn) => (String(fn).includes('data-message-author-role') ? turns : undefined),
     locator: () => locator,
     $: async () => null,
-    keyboard: { press: async () => {} },
+    keyboard: { press: async () => {}, type: async (t, opts) => { calls.keyboardType = opts; content = t; } },
     waitForTimeout: async () => {},
   };
   return { page, calls };
@@ -93,11 +93,20 @@ async function fillOptionsFor(text) {
   console.log('PASS: typeAndSubmit passes the scaled timeout to fill()'); passed++;
 
   {
-    const { page, calls } = pageDouble({ landed: false });
-    await assert.rejects(typeAndSubmit(page, 'y'.repeat(20000)), (e) => e.code === 'page_load_failed'
-      && /too long for per-key typing/.test(e.message));
+    const { page, calls } = pageDouble({ landed: false, fillDelayMs: 50 });
+    const timing = {};
+    await assert.rejects(typeAndSubmit(page, 'y'.repeat(20000), false, null, timing),
+      (e) => e.code === 'server_error' && /did not land.*too long for per-key typing/.test(e.message));
     assert.strictEqual(calls.pressSeq, null, 'long text must not be typed key by key');
-    console.log('PASS: long text that did not land fails fast as page_load_failed'); passed++;
+    assert.ok(timing.inputMs >= 50, `input time must be reported on failure too, got ${timing.inputMs}`);
+    console.log('PASS: long text that did not land fails fast, non-retryable, with its input time'); passed++;
+  }
+  {
+    const { page, calls } = pageDouble({ landed: true });
+    await assert.rejects(typeAndSubmit(page, 'y'.repeat(20000), true),
+      (e) => e.code === 'server_error' && /around the attachments/.test(e.message));
+    assert.strictEqual(calls.keyboardType, null, 'long text must not be typed around attachments');
+    console.log('PASS: long text is not typed key by key around attachments'); passed++;
   }
   {
     const text = 'short prompt';
@@ -107,10 +116,18 @@ async function fillOptionsFor(text) {
     console.log('PASS: short text falls back to per-key typing with its own budget'); passed++;
   }
   {
-    const { page } = pageDouble({ landed: true, fillDelayMs: 50 });
-    const res = await typeAndSubmit(page, 'landed prompt');
-    assert.ok(res && res.inputMs >= 50 && res.inputMs < 5000, `inputMs=${res && res.inputMs}`);
+    const { page, calls } = pageDouble({ landed: true, fillDelayMs: 50 });
+    const timing = {};
+    await typeAndSubmit(page, 'landed prompt', false, null, timing);
+    assert.ok(timing.inputMs >= 50 && timing.inputMs < 5000, `inputMs=${timing.inputMs}`);
+    assert.strictEqual(calls.keyboardType, null);
     console.log('PASS: typeAndSubmit reports the time spent on input'); passed++;
+  }
+  {
+    const { page, calls } = pageDouble({ landed: true });
+    await typeAndSubmit(page, 'short caption', true);
+    assert.deepStrictEqual(calls.keyboardType, { delay: 10 });
+    console.log('PASS: short text is still typed around attachments'); passed++;
   }
   {
     // Input that ate the whole response window: the wait must give up on its first pass

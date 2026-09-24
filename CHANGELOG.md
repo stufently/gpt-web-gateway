@@ -7,15 +7,17 @@ Two review findings on 2.14.2, both about what happens around the longer fill bu
 - **Input time comes out of the response wait.** The response wait had its own 360 s base
   window, counted from submit, so a 90 s fill added 60 s to the request on top of everything
   that was there before. Input time beyond the old flat 30 s is now subtracted from that base
-  window, and the request budget is back to what it was before 2.14.2. The adaptive +120 s
-  extension for an answer that is still streaming is unchanged.
-- **The per-key fallback gets an honest budget or does not run.** When `fill()` returns but
-  the prompt is not in the composer, the gateway retypes it key by key at 10 ms a character,
-  with Playwright's default 30 s action timeout. That is 300 s of typing for a 30k-char prompt,
-  so the fallback could only time out. Its budget is now `30 s + 10 ms per character`. When
-  that exceeds 120 s (over ~9k chars), the gateway does not start typing: it fails at once
-  with a retryable `page_load_failed` and the text turn starts again on a fresh page, the
-  same as the other composer failures before submit.
+  window, counted over every attempt of the turn, and the request budget is back to what it
+  was before 2.14.2. The adaptive +120 s extension for an answer that is still streaming is
+  unchanged.
+- **Per-key typing gets an honest budget or does not run.** When `fill()` returns but the
+  prompt is not in the composer, the gateway retypes it key by key at 10 ms a character, with
+  Playwright's default 30 s action timeout. That is 300 s of typing for a 30k-char prompt, so
+  the fallback could only time out. Its budget is now `30 s + 10 ms per character`. When that
+  exceeds 120 s (over ~9k chars), the gateway does not start typing and fails at once with
+  `server_error`. That error is deliberately not retried: a fresh page would repeat the same
+  long input. The same limit now guards the path that types around attachments or a composer
+  token, which had no timeout at all.
 
 ## 2.14.2 — the composer fill budget scales with prompt length (2026-09-24)
 
