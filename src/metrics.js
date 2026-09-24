@@ -22,6 +22,9 @@ const counters = {
     // that kind arms a global cooldown that blocks every endpoint for 30 min, while this
     // affects exactly one tier — a retry succeeds immediately on the fallback tier.
     tier_limit: 0,
+    // The prompt is too long for the only input path that keeps attachments / a composer
+    // token (per-key typing). Deterministic for that input: not retried, not an infra failure.
+    prompt_too_long: 0,
   },
   generations_total: 0,
   edits_total: 0,
@@ -34,7 +37,7 @@ const DURATION_BUCKETS = [5, 10, 20, 30, 60, 90, 120, 180, 240, 300];
 const DURATION_LABELS = [
   'success', 'refused', 'policy_violation', 'rate_limit', 'login_failed',
   'timeout', 'server_error', 'queue_full', 'upload_failed', 'page_load_failed',
-  'conversation_not_found', 'tier_limit',
+  'conversation_not_found', 'tier_limit', 'prompt_too_long',
 ];
 
 function makeHistogramSeries() {

@@ -2328,11 +2328,13 @@ function typeFallbackTimeoutMs(text) {
   const budget = FILL_BASE_TIMEOUT_MS + (text ? text.length : 0) * TYPE_DELAY_MS;
   return budget > FILL_MAX_TIMEOUT_MS ? null : budget;
 }
-// Not retried (server_error is not transient for text turns): a fresh page would repeat the
-// same long input, so each retry would add up to FILL_MAX_TIMEOUT_MS to the request.
-function tooLongToTypeError(text, why) {
+// Never retried by completeText (neither kind is transient there): a fresh page would repeat
+// the same long input, so each retry would add up to FILL_MAX_TIMEOUT_MS to the request.
+// `kind` is prompt_too_long when the input alone decides the outcome (the keep-attachments
+// path can only type), server_error when the composer failed to take a fill.
+function tooLongToTypeError(text, why, kind) {
   const err = new Error(`Prompt ${why} (${text.length} chars is too long for per-key typing)`);
-  err.code = 'server_error';
+  err.code = kind;
   return err;
 }
 // Input time beyond the old flat 30 s comes out of the response wait, so a slow fill of a
@@ -2367,7 +2369,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
       // keyboard.type has no timeout of its own: a long prompt here would hold the queue for
       // as long as typing takes.
       if (typeFallbackTimeoutMs(text) === null) {
-        throw tooLongToTypeError(text, `cannot be typed around the ${hasSystemHint ? 'composer token' : 'attachments'}`);
+        throw tooLongToTypeError(text, `cannot be typed around the ${hasSystemHint ? 'composer token' : 'attachments'}`, 'prompt_too_long');
       }
       console.log(`Using keyboard type to preserve ${hasSystemHint ? 'composer token' : 'attachments'}...`);
       await textareaLocator.first().click();
@@ -2388,7 +2390,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
 
     if (!content || (probe && !normText(content).includes(probe))) {
       const typeTimeout = typeFallbackTimeoutMs(text);
-      if (typeTimeout === null) throw tooLongToTypeError(text, 'did not land in the composer');
+      if (typeTimeout === null) throw tooLongToTypeError(text, 'did not land in the composer', 'server_error');
       console.log('Fill failed, trying pressSequentially...');
       await textareaLocator.first().click();
       await p.keyboard.press(caretEndKey).catch(() => {});

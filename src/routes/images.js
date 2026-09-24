@@ -286,6 +286,7 @@ function respondWithError(res, startedAt, err) {
     refused: 422,
     policy_violation: 422,
     conversation_not_found: 404,
+    prompt_too_long: 413,
     login_failed: 503,
     upload_failed: 503,
     // Not 429: that is the global-cooldown path. One tier is out of quota, the service is fine.
@@ -1148,6 +1149,7 @@ module.exports._internals = {
   assertNotRateLimited,
   handleRateLimitError,
   queueFullRetryAfterSec,
+  respondWithError,
   getRateLimitedUntil: () => rateLimitedUntil,
   setRateLimitedUntil: (value) => { rateLimitedUntil = value; },
 };

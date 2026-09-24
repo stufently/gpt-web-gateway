@@ -22,6 +22,30 @@ ok('the budget is capped at 120 s', () => {
   assert.strictEqual(fillTimeoutMs('x'.repeat(200000)), 120000);
 });
 
+ok('prompt_too_long is a non-retryable, non-infra 413', () => {
+  const { classifyError, shouldRetryKind } = require('../src/metrics');
+  const { INFRA_ERROR_KINDS } = require('../src/progress');
+  assert.strictEqual(classifyError('Prompt cannot be typed around the attachments', 'prompt_too_long'), 'prompt_too_long');
+  assert.strictEqual(shouldRetryKind('prompt_too_long'), false);
+  assert.strictEqual(INFRA_ERROR_KINDS.has('prompt_too_long'), false);
+});
+
+ok('prompt_too_long answers 413 without a retry hint', () => {
+  const { respondWithError } = require('../src/routes/images')._internals;
+  const res = {
+    headers: {}, code: 0, body: null,
+    set(k, v) { this.headers[k] = v; return this; },
+    status(c) { this.code = c; return this; },
+    json(b) { this.body = b; return this; },
+  };
+  const err = new Error('Prompt cannot be typed around the attachments (20000 chars is too long for per-key typing)');
+  err.code = 'prompt_too_long';
+  respondWithError(res, Date.now(), err);
+  assert.strictEqual(res.code, 413);
+  assert.strictEqual(res.body.error_kind, 'prompt_too_long');
+  assert.strictEqual(res.body.should_retry, false);
+});
+
 ok('per-key fallback budget is 30 s + 10 ms/char while it fits under 120 s', () => {
   assert.strictEqual(typeFallbackTimeoutMs('x'.repeat(100)), 31000);
   assert.strictEqual(typeFallbackTimeoutMs('x'.repeat(9000)), 120000);
@@ -104,7 +128,7 @@ async function fillOptionsFor(text) {
   {
     const { page, calls } = pageDouble({ landed: true });
     await assert.rejects(typeAndSubmit(page, 'y'.repeat(20000), true),
-      (e) => e.code === 'server_error' && /around the attachments/.test(e.message));
+      (e) => e.code === 'prompt_too_long' && /around the attachments/.test(e.message));
     assert.strictEqual(calls.keyboardType, null, 'long text must not be typed around attachments');
     console.log('PASS: long text is not typed key by key around attachments'); passed++;
   }

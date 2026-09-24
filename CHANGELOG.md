@@ -15,9 +15,14 @@ Two review findings on 2.14.2, both about what happens around the longer fill bu
   Playwright's default 30 s action timeout. That is 300 s of typing for a 30k-char prompt, so
   the fallback could only time out. Its budget is now `30 s + 10 ms per character`. When that
   exceeds 120 s (over ~9k chars), the gateway does not start typing and fails at once with
-  `server_error`. That error is deliberately not retried: a fresh page would repeat the same
-  long input. The same limit now guards the path that types around attachments or a composer
-  token, which had no timeout at all.
+  `server_error`. The text turn deliberately does not retry it: a fresh page would repeat the
+  same long input.
+- **New error kind `prompt_too_long` (HTTP 413, `should_retry: false`).** The path that keeps
+  attachments or a composer token can only type key by key, and had no timeout at all. A
+  prompt over ~9k chars there is now refused up front. That outcome depends on the input
+  alone, so it is not an infra failure: it does not count toward the `/health/live` failure
+  streak and does not tell the client to retry. It shows up as
+  `gpt_web_gateway_errors_total{type="prompt_too_long"}`.
 
 ## 2.14.2 — the composer fill budget scales with prompt length (2026-09-24)
 
