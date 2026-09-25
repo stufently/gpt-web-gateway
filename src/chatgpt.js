@@ -2344,6 +2344,22 @@ function responseBaseBudgetMs(inputMs) {
   return Math.max(CHAT_COMPLETION_TIMEOUT_MS - overrun, 0);
 }
 
+// keyboard.type() and pressSequentially() press Enter for '\n', and Enter in ChatGPT's
+// composer SENDS the message. A multi-line prompt typed that way went out in pieces: an edit
+// with `aspect_ratio` ("...\n\nAspect ratio: 3:2.") sent the first part with the image and
+// left the hint in the composer, so every such edit failed its submit check (2026-09-18).
+// Line breaks are typed as Shift+Enter, which inserts a break without sending.
+function promptLines(text) {
+  return String(text || '').replace(/\r\n?/g, '\n').split('\n');
+}
+async function typeLines(text, typeSegment, pressNewline) {
+  const lines = promptLines(text);
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) await pressNewline();
+    if (lines[i]) await typeSegment(lines[i]);
+  }
+}
+
 // Type prompt and submit
 // onSubmitted (optional): called the instant the send is CONFIRMED (a new user turn / stop
 // button appeared), BEFORE the trailing settle wait. Callers use it to mark the prompt as
@@ -2363,7 +2379,42 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   const caretEndKey = process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End';
   const inputStart = Date.now();
   const normText = (s) => (s || '').replace(/\s+/g, ' ').trim();
-  const probe = normText((text || '').split('\n')[0]).slice(0, 30);
+  // Probe for "the prompt is in the composer": the head of the first line. ProseMirror's
+  // textContent joins lines without a separator, so a probe must not span lines.
+  const nonEmptyLines = promptLines(text).map(normText).filter(Boolean);
+  const probe = (nonEmptyLines[0] || '').slice(0, 30);
+  // For multi-line text typed key by key: the composer must END with every line, laid end to
+  // end. A prompt cut short by a stray Enter keeps its head in the chat and its tail in the
+  // composer, and a head-only probe cannot see a lost line. Whitespace is ignored (textContent
+  // joins lines without a separator); whatever precedes the typed text (a composer token) is
+  // ignored too. A list/heading marker at a line start ("- ", "1. ", "> ", "# ") may become
+  // formatting and vanish from textContent, so each line matches with or without it.
+  const squash = (s) => (s || '').replace(/\s+/g, '');
+  const LINE_MARKER = /^(?:[-*+>]|\d+[.)]|#{1,6})(?=\s|$)/;
+  const lineForms = nonEmptyLines.map((l) => {
+    const full = squash(l);
+    const bare = squash(l.replace(LINE_MARKER, ''));
+    return bare === full ? [full] : [full, bare];
+  });
+  const allLinesLanded = (raw) => {
+    const hay = squash(raw);
+    // Walk the lines from the last one back, keeping every position the text so far could
+    // start at (a line matching with and without its marker forks it). Iterative: a prompt
+    // may have thousands of lines, too many for recursion.
+    let ends = new Set([hay.length]);
+    for (let i = lineForms.length - 1; i >= 0 && ends.size > 0; i--) {
+      const next = new Set();
+      for (const end of ends) {
+        for (const form of lineForms[i]) {
+          const start = end - form.length;
+          if (start >= 0 && hay.startsWith(form, start)) next.add(start);
+        }
+      }
+      ends = next;
+    }
+    return ends.size > 0;
+  };
+  let typedPerKey = false;
   try {
     if (preserveAttachments || hasSystemHint) {
       // keyboard.type has no timeout of its own: a long prompt here would hold the queue for
@@ -2375,7 +2426,10 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
       await textareaLocator.first().click();
       await p.keyboard.press(caretEndKey).catch(() => {});
       await p.waitForTimeout(300);
-      await p.keyboard.type(text, { delay: TYPE_DELAY_MS });
+      typedPerKey = true;
+      await typeLines(text,
+        (line) => p.keyboard.type(line, { delay: TYPE_DELAY_MS }),
+        () => p.keyboard.press('Shift+Enter'));
     } else {
       await textareaLocator.first().fill(text, { timeout: fillTimeoutMs(text) });
     }
@@ -2395,8 +2449,23 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
       await textareaLocator.first().click();
       await p.keyboard.press(caretEndKey).catch(() => {});
       await p.waitForTimeout(300);
-      await textareaLocator.first().pressSequentially(text, { delay: TYPE_DELAY_MS, timeout: typeTimeout });
+      typedPerKey = true;
+      const typeDeadline = Date.now() + typeTimeout;
+      const remaining = () => Math.max(1, typeDeadline - Date.now());
+      await typeLines(text,
+        (line) => textareaLocator.first().pressSequentially(line, { delay: TYPE_DELAY_MS, timeout: remaining() }),
+        () => textareaLocator.first().press('Shift+Enter', { timeout: remaining() }));
       await p.waitForTimeout(500);
+    }
+    // Only per-key typing can split a prompt; fill() puts the text in one transaction.
+    if (typedPerKey && lineForms.length > 1
+        && !allLinesLanded(await textareaLocator.first().textContent().catch(() => ''))) {
+      // Retyping would append a second copy after the part that did land; sending would
+      // deliver a truncated prompt. Neither is right — fail this turn as retryable.
+      markSessionDegraded('prompt landed only partially in the composer');
+      const err = new Error('Prompt landed only partially in the composer (a line is missing)');
+      err.code = 'page_load_failed';
+      throw err;
     }
   } finally {
     if (timing) timing.inputMs = Date.now() - inputStart;
@@ -4036,6 +4105,7 @@ module.exports = {
     CHAT_COMPLETION_TIMEOUT_MS,
     waitAndExtractText,
     typeAndSubmit,
+    appendAspectRatioHint,
     imageOutcomePredicate,
     setThinkingMode,
     waitAndExtractImage,

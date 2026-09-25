@@ -136,7 +136,12 @@ async function fillOptionsFor(text) {
     const text = 'short prompt';
     const { page, calls } = pageDouble({ landed: false });
     await typeAndSubmit(page, text);
-    assert.deepStrictEqual(calls.pressSeq, { delay: 10, timeout: typeFallbackTimeoutMs(text) });
+    // The budget is a deadline over the whole text (typed line by line), so the timeout
+    // handed to the call is what is left of it: at most the budget, a few ms under it here.
+    const budget = typeFallbackTimeoutMs(text);
+    assert.strictEqual(calls.pressSeq.delay, 10);
+    assert.ok(calls.pressSeq.timeout <= budget && calls.pressSeq.timeout > budget - 1000,
+      `timeout=${calls.pressSeq.timeout} budget=${budget}`);
     console.log('PASS: short text falls back to per-key typing with its own budget'); passed++;
   }
   {

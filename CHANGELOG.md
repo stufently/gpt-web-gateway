@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.14.4 — multi-line prompts are typed as one message (2026-09-25)
+
+Every `/v1/images/edits` request with `aspect_ratio` failed from 2026-09-18 on, with
+`Prompt submit not confirmed (no new user turn, composer unchanged)`. Three such failures in a
+row also failed `/health/live` and restarted the pod.
+
+The aspect-ratio hint is appended to the prompt after a blank line
+(`...\n\nAspect ratio: 3:2.`). An edit keeps its image attachment, so the prompt cannot be
+filled in one go: it is typed key by key, and Playwright's `keyboard.type()` presses Enter
+for `\n`. In ChatGPT's composer Enter sends the message. The first part went out with the
+image, the hint line stayed in the composer, the "did the prompt land" check found only that
+line, and the send button had nothing left to send.
+
+- **Line breaks are typed as Shift+Enter** on every per-key path: `keyboard.type()` around
+  attachments or a composer token (edits, generations with references, chat with the
+  web-search pill), and the `pressSequentially()` fallback after a `fill()` that did not land.
+  This fixes any multi-line prompt on those paths, including `Quality:` hints and multi-line
+  chat input, not only the aspect-ratio hint. `\r\n` and `\r` count as line breaks too.
+- **The landing check covers every line.** It used to probe only the head of the first line,
+  which cannot see a lost tail. After per-key typing of a multi-line prompt, the composer
+  text must now end with every non-empty line, in order and with nothing between them.
+  Whitespace is ignored, since ProseMirror joins lines without a separator. Anything before
+  the typed text, such as a composer token, is ignored too. A list or heading marker at a line start (`- `, `1. `, `> `,
+  `# `) is optional, since a composer may turn it into formatting. If a line is missing, the
+  turn fails as a retryable `page_load_failed` and the page is reset. The old code would have
+  sent a truncated prompt, and retyping would have added a second copy after the part that
+  did land. Single-line prompts and `fill()` keep the old check: `fill()` sets the text in
+  one transaction.
+
 ## 2.14.3 — slow input no longer stretches the request; the per-key fallback knows its limits (2026-09-24)
 
 Two review findings on 2.14.2, both about what happens around the longer fill budget.
