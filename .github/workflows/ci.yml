@@ -8,6 +8,9 @@ on:
 
 jobs:
   test:
+    # Self-hosted раннер на op1 (privileged dind): код из PR форков публичного репо
+    # на нём не исполняем — только push и PR из веток самого репо.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: op1-gpt-web-gateway
     container: node:20
     env:
@@ -22,6 +25,8 @@ jobs:
         run: npm test
 
   docker:
+    # То же ограничение, что у test (needs не наследует if).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: op1-gpt-web-gateway
     needs: test
     permissions:
