@@ -9,6 +9,10 @@ const {
   challengeGraceExpired, effectiveGapMs,
 } = require('./cloudflare');
 const { solveTurnstile } = require('./turnstile');
+const {
+  COMPOSER_VISIBLE_SEL, SYSTEM_HINT_SEL, SEND_BUTTON_SEL, FILE_INPUT_SEL, ATTACHMENT_REMOVE_SEL,
+  TIER_TRIGGER_SEL, TIER_TRIGGER_VISIBLE_SEL, TIER_CAPTION_RE, stripTierCaption, readComposerText,
+} = require('./composer-dom');
 const { SseAccumulator, parseSseBody, extractAssistantFromMapping, isValidConversationId } = require('./lib/conversation-read');
 const { trimConversationData } = require('./lib/conversation-trim');
 // Liveness heartbeat for /health/live — named `liveness` to avoid clashing with the
@@ -720,7 +724,7 @@ async function _createPage() {
         await p.waitForTimeout(500);
       }
 
-      const textarea = await p.$('[id="prompt-textarea"]:visible, textarea:visible');
+      const textarea = await p.$(COMPOSER_VISIBLE_SEL);
       if (textarea) {
         console.log('ChatGPT loaded and ready.');
         break;
@@ -753,7 +757,7 @@ async function _createPage() {
 
     finalTitle = await p.title().catch(() => '');
     const blocked = looksLikeCloudflareChallenge(finalTitle, safeHeaders(navResponse));
-    const hasComposer = await p.$('[id="prompt-textarea"]:visible, textarea:visible').catch(() => null);
+    const hasComposer = await p.$(COMPOSER_VISIBLE_SEL).catch(() => null);
     // Treat the full auth surface as "ready enough" — a logged-out page must still be
     // handed to ensureLoggedIn()/auto-login, not killed as page_load_failed. Covers
     // Log in / Sign up / Get started CTAs, the auth URL, and visible email/password fields.
@@ -1206,7 +1210,7 @@ async function ensureChatMode(p) {
     // prefix ("5.6 Sol Очень высокий"), the Chat pill is a plain level name. Staying on
     // Work is NOT acceptable (wrong effort tier, agentic behavior) — fail the request
     // fast and let the retry machinery run it on a recovered session.
-    const pillNow = await p.locator('.__composer-pill').last().innerText({ timeout: 800 }).catch(() => '');
+    const pillNow = stripTierCaption(await p.locator(TIER_TRIGGER_VISIBLE_SEL).last().innerText({ timeout: 800 }).catch(() => ''));
     const looksWork = PILL_MODEL_PREFIX.test((pillNow || '').trim());
     console.log(`[ui-adapter] Chat/Work switcher: forced Chat (workActive=${seg.workActive}, pill now "${(pillNow || '').trim()}"${looksWork ? ' — STILL LOOKS LIKE WORK' : ''})`);
     if (looksWork) {
@@ -1230,7 +1234,7 @@ async function ensureNewChat(p) {
   await recoverContentFailed(p);
 
   for (let i = 0; i < 15; i++) {
-    const textarea = await p.$('[id="prompt-textarea"]:visible, textarea:visible');
+    const textarea = await p.$(COMPOSER_VISIBLE_SEL);
     if (textarea) break;
     await p.waitForTimeout(1000);
   }
@@ -1260,7 +1264,7 @@ async function openConversation(p, conversationId) {
 
   let composer = null;
   for (let i = 0; i < 15; i++) {
-    composer = await p.$('[id="prompt-textarea"]:visible, textarea:visible');
+    composer = await p.$(COMPOSER_VISIBLE_SEL);
     if (composer) break;
     // A missing/foreign conversation bounces back to the new-chat URL or shows an
     // error state — poll a bit, then fail below if the composer never appeared.
@@ -1292,17 +1296,8 @@ async function openConversation(p, conversationId) {
 // Count visible "Remove …" chips that ChatGPT renders for each pending attachment
 // in the composer. Covers Remove file/attachment/image and Russian "Удалить".
 async function countAttachmentChips(p) {
-  return await p.evaluate(() => {
-    const sels = [
-      'button[aria-label^="Remove file"]',
-      'button[aria-label^="Remove attachment"]',
-      'button[aria-label^="Remove image"]',
-      'button[aria-label^="Удалить"]',
-    ];
-    let count = 0;
-    for (const sel of sels) count += document.querySelectorAll(sel).length;
-    return count;
-  }).catch(() => 0);
+  return await p.evaluate((sel) => document.querySelectorAll(sel).length, ATTACHMENT_REMOVE_SEL)
+    .catch(() => 0);
 }
 
 // Upload one or more images to the chat via the native <input type="file"> element.
@@ -1328,10 +1323,10 @@ async function uploadImage(p, imageInputs) {
   // Retries only trigger when the chip count is truly stuck below files.length.
   const waitIters = Math.min(30 + 10 * (files.length - 1), 60);
 
-  // Prefer the dedicated photos input (id="upload-photos") over the camera one.
+  // Prefer the photos input over the camera one (FILE_INPUT_SEL, ./composer-dom).
   // React on this input ignores Playwright's setInputFiles alone — we must
   // dispatch input/change events ourselves to wake the composer.
-  const fileInput = p.locator('#upload-photos, input[type="file"]:not(#upload-camera)').first();
+  const fileInput = p.locator(FILE_INPUT_SEL).first();
   await fileInput.waitFor({ state: 'attached', timeout: 10000 });
 
   let lastChipCount = 0;
@@ -1391,7 +1386,7 @@ async function uploadImage(p, imageInputs) {
 }
 
 async function clearComposer(p) {
-  const textareaLocator = p.locator('#prompt-textarea');
+  const textareaLocator = p.locator(COMPOSER_VISIBLE_SEL);
   const count = await textareaLocator.count();
   if (!count) return;
 
@@ -1403,17 +1398,9 @@ async function clearComposer(p) {
 }
 
 async function removePendingAttachments(p) {
-  await p.evaluate(() => {
-    const selectors = [
-      'button[aria-label^="Remove file"]',
-      'button[aria-label^="Remove attachment"]',
-      'button[aria-label^="Remove image"]',
-      'button[aria-label^="Удалить"]',
-    ];
-    for (const selector of selectors) {
-      document.querySelectorAll(selector).forEach(btn => btn.click());
-    }
-  }).catch(() => {});
+  await p.evaluate((sel) => {
+    document.querySelectorAll(sel).forEach((btn) => btn.click());
+  }, ATTACHMENT_REMOVE_SEL).catch(() => {});
 }
 
 async function saveDebugSnapshot(p, label) {
@@ -1436,7 +1423,7 @@ async function captureConversationState(p) {
     const text = document.body.innerText || '';
     // Keep the filter in sync with imageOutcomePredicate: user-turn images (uploaded
     // attachments rendered in sent messages) are excluded on both sides of the diff.
-    const notInUserTurn = (el) => !(el.closest && el.closest('[data-message-author-role="user"]'));
+    const notInUserTurn = (el) => !(el.closest && el.closest('[data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-user-message-bubble]'));
     const imageIds = Array.from(document.querySelectorAll('div[id^="image-"]'))
       .filter(notInUserTurn)
       .map(el => el.id)
@@ -1457,7 +1444,7 @@ async function captureConversationState(p) {
 async function captureTextState(p) {
   return await p.evaluate(() => {
     const getAssistantMessages = () => {
-      const explicit = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+      const explicit = Array.from(document.querySelectorAll('[data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]'));
       const nodes = explicit.length
         ? explicit
         : Array.from(document.querySelectorAll('article, [data-testid*="conversation-turn"]'))
@@ -1728,7 +1715,7 @@ function imageOutcomePredicate({ previousImageIds, previousLargeImages, previous
   // Images inside USER turns are the just-uploaded edit/reference attachments rendered
   // full-size in the sent message — they must NOT count as a generation result
   // (otherwise an edit request that gets refused looks like instant "success").
-  const notInUserTurn = (el) => !(el.closest && el.closest('[data-message-author-role="user"]'));
+  const notInUserTurn = (el) => !(el.closest && el.closest('[data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-user-message-bubble]'));
   const imageIds = Array.from(document.querySelectorAll('div[id^="image-"]'))
     .filter(notInUserTurn)
     .map(el => el.id)
@@ -1747,7 +1734,7 @@ function imageOutcomePredicate({ previousImageIds, previousLargeImages, previous
   // turn roles — the user's own prompt (which may legitimately contain words like
   // "copyright" or "watermark") must never trigger policy detection. Fall back to the
   // body tail when the turn structure is not readable (old behavior).
-  const assistantTurns = document.querySelectorAll('[data-message-author-role="assistant"]');
+  const assistantTurns = document.querySelectorAll('[data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]');
   const lastAssistantRaw = assistantTurns.length
     ? ((assistantTurns[assistantTurns.length - 1].innerText || ''))
     : '';
@@ -1818,7 +1805,7 @@ async function readProgressIndicators(p, previousTailText = '') {
     // Prefer the last assistant turn as the verbatim model message — the body tail
     // also contains footer/composer chrome that only confuses the API client.
     const readLastAssistantText = () => {
-      const turns = document.querySelectorAll('[data-message-author-role="assistant"]');
+      const turns = document.querySelectorAll('[data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]');
       const last = turns[turns.length - 1];
       const t = last ? (last.innerText || '').trim() : '';
       return t ? t.slice(0, 600) : '';
@@ -1884,7 +1871,7 @@ async function readUiErrorBanner(p) {
 // the UI. Falls back to the body tail when the turn structure is not readable.
 async function readLastAssistantMessage(p) {
   return await p.evaluate(() => {
-    const turns = document.querySelectorAll('[data-message-author-role="assistant"]');
+    const turns = document.querySelectorAll('[data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"]');
     const last = turns[turns.length - 1];
     const t = last ? (last.innerText || '').trim() : '';
     return t ? t.slice(0, 600) : (document.body.innerText || '').slice(-400);
@@ -2101,7 +2088,7 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
     for (let i = 0; i < 20; i++) {
       const currentNew = await p.evaluate((prevIds) => {
         return Array.from(document.querySelectorAll('div[id^="image-"]'))
-          .filter(el => !(el.closest && el.closest('[data-message-author-role="user"]')))
+          .filter(el => !(el.closest && el.closest('[data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-user-message-bubble]')))
           .map(el => el.id)
           .filter(id => id && !prevIds.includes(id));
       }, previousImageIds);
@@ -2158,7 +2145,7 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
       // newest container if a new one appeared.
       const refreshed = await p.evaluate((prevIds) => {
         return Array.from(document.querySelectorAll('div[id^="image-"]'))
-          .filter(el => !(el.closest && el.closest('[data-message-author-role="user"]')))
+          .filter(el => !(el.closest && el.closest('[data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-user-message-bubble]')))
           .map(el => el.id)
           .filter(id => id && !prevIds.includes(id));
       }, previousImageIds);
@@ -2185,7 +2172,7 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
     ? newImageIds[newImageIds.length - 1]
     : await p.evaluate(() => {
         const all = Array.from(document.querySelectorAll('div[id^="image-"]'))
-          .filter(el => !(el.closest && el.closest('[data-message-author-role="user"]')))
+          .filter(el => !(el.closest && el.closest('[data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-user-message-bubble]')))
           .map(el => el.id)
           .filter(Boolean);
         return all.length > 0 ? all[all.length - 1] : null;
@@ -2248,7 +2235,7 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
       const all = Array.from(imgs);
       // Never extract images from USER turns — those are the caller's own uploaded
       // attachments (an edit request must not "succeed" by returning the input image).
-      const inUserTurn = (img) => !!(img.closest && img.closest('[data-message-author-role="user"]'));
+      const inUserTurn = (img) => !!(img.closest && img.closest('[data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-user-message-bubble]'));
       let bestImg = null;
       for (let j = all.length - 1; j >= 0; j--) {
         const img = all[j];
@@ -2369,12 +2356,12 @@ async function typeLines(text, typeSegment, pressNewline) {
 async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted = null, timing = null) {
   console.log('Typing prompt...');
   await dismissModals(p);
-  const textareaLocator = p.locator('#prompt-textarea');
+  const textareaLocator = p.locator(COMPOSER_VISIBLE_SEL);
   await textareaLocator.first().waitFor({ state: 'visible', timeout: 30000 });
 
   // fill() REPLACES the ProseMirror doc — it wipes attachments AND composer system-hint
   // tokens (the 2026-07 web-search pill lives INSIDE the editor). Preserve both by typing.
-  const hasSystemHint = await p.locator('#prompt-textarea [data-system-hint-type]').count()
+  const hasSystemHint = await p.locator(SYSTEM_HINT_SEL).count()
     .then((c) => c > 0).catch(() => false);
   const caretEndKey = process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End';
   const inputStart = Date.now();
@@ -2439,7 +2426,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     // system-hint token in the doc, textContent is truthy even if typing silently failed.
     // Probe with the first line only: ProseMirror textContent concatenates paragraphs
     // without separators, so multi-line probes would false-negative.
-    const content = await textareaLocator.first().textContent();
+    const content = await readComposerText(textareaLocator.first());
     console.log('Prompt filled:', content ? content.substring(0, 50) + '...' : '(empty)');
 
     if (!content || (probe && !normText(content).includes(probe))) {
@@ -2459,7 +2446,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     }
     // Only per-key typing can split a prompt; fill() puts the text in one transaction.
     if (typedPerKey && lineForms.length > 1
-        && !allLinesLanded(await textareaLocator.first().textContent().catch(() => ''))) {
+        && !allLinesLanded(await readComposerText(textareaLocator.first()).catch(() => ''))) {
       // Retyping would append a second copy after the part that did land; sending would
       // deliver a truncated prompt. Neither is right — fail this turn as retryable.
       markSessionDegraded('prompt landed only partially in the composer');
@@ -2477,7 +2464,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   // Baseline BEFORE submitting — verification below works on deltas: a stop-button left
   // over from a previous turn or a composer rerender must not count as "submitted".
   const countUserTurns = () => p.evaluate(
-    () => document.querySelectorAll('[data-message-author-role="user"]').length
+    () => document.querySelectorAll('[data-message-author-role="user"], [data-content-search-unit-key$=":user"]').length
   ).catch(() => -1);
   const userTurnsBefore = await countUserTurns();
   const STOP_BTN = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Остановить"]';
@@ -2487,9 +2474,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
 
   // Use locator to avoid "element detached from DOM" errors
   // Image 2.0 UI may rename aria-label — keep multiple fallbacks
-  const sendLocator = p.locator(
-    'button[data-testid="send-button"], #composer-submit-button, button[aria-label="Send prompt"], button[aria-label^="Отправить"]'
-  );
+  const sendLocator = p.locator(SEND_BUTTON_SEL);
   try {
     await sendLocator.first().waitFor({ state: 'visible', timeout: 5000 });
     console.log('Send button found. Clicking...');
@@ -2500,7 +2485,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     // per request and jammed the queue.
     console.log('Send button not found. Refocusing composer for Enter fallback...');
     await textareaLocator.first().click().catch(() => {});
-    const stillThere = await textareaLocator.first().textContent().catch(() => '');
+    const stillThere = await readComposerText(textareaLocator.first()).catch(() => '');
     if (probe && !normText(stillThere).includes(probe)) {
       markSessionDegraded('composer lost the prompt before Enter fallback');
       const err = new Error('Prompt vanished from composer before submit');
@@ -2518,7 +2503,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   while (Date.now() < submitDeadline) {
     const turnsNow = await countUserTurns();
     if (userTurnsBefore >= 0 && turnsNow > userTurnsBefore) { submitted = true; break; }
-    const composerNow = normText(await textareaLocator.first().textContent().catch(() => ''));
+    const composerNow = normText(await readComposerText(textareaLocator.first()).catch(() => ''));
     const probeGone = probe && !composerNow.includes(probe);
     if (probeGone) {
       const stopNow = !!(await p.$(STOP_BTN).catch(() => null));
@@ -2633,21 +2618,28 @@ const ANY_LEVEL_PILL = /^(?:(?:gpt-)?\d[\d.]*(?:\s+[a-z]+)?\s+)?(instant|medium|
 // Returns { level: 'instant'|'medium'|'high'|'veryhigh'|'pro'|null, pillText }.
 async function readPillLevel(p) {
   const matchers = Object.entries(LEVEL_MATCH).map(([k, rx]) => [k, rx.source]);
-  return await p.evaluate(({ matchers, prefixSrc }) => {
+  return await p.evaluate(({ matchers, prefixSrc, captionSrc, triggerSel }) => {
     const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
     const visible = (el) => {
       const r = el.getBoundingClientRect();
       return r.width > 0 && r.height > 0;
     };
     const PREFIX = new RegExp(prefixSrc, 'i');
-    const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
+    const CAPTION = new RegExp(captionSrc, 'i');
+    // The dedicated trigger (2026-09 markup) goes first: it IS the control, so a sidebar
+    // button that happens to read "High…" can never win over it. The generic scan stays as
+    // the fallback for markup we do not know yet.
+    const triggers = Array.from(document.querySelectorAll(triggerSel)).filter(visible);
+    const generic = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
     // Search from the end — the composer sits below the chat history.
+    const buttons = [...generic, ...triggers];
     for (let i = buttons.length - 1; i >= 0; i--) {
       const text = norm(buttons[i].innerText || buttons[i].textContent || '');
       if (!text || text.length > 40) continue;
-      // Work-tab pill prefixes the level with the model name ("5.6 sol очень высокий") —
-      // try both the raw text and the prefix-stripped variant.
-      const candidates = [text, text.replace(PREFIX, '')];
+      // Work-tab pill prefixes the level with the model name ("5.6 sol очень высокий"), the
+      // 2026-09 trigger may prefix a caption ("thinking effort medium") — try all variants.
+      const uncaptioned = text.replace(CAPTION, '');
+      const candidates = [text, text.replace(PREFIX, ''), uncaptioned, uncaptioned.replace(PREFIX, '')];
       for (const cand of candidates) {
         for (const [level, src] of matchers) {
           if (new RegExp(src, 'i').test(cand)) return { level, pillText: text };
@@ -2655,7 +2647,8 @@ async function readPillLevel(p) {
       }
     }
     return { level: null, pillText: '' };
-  }, { matchers, prefixSrc: PILL_MODEL_PREFIX.source }).catch(() => ({ level: null, pillText: '' }));
+  }, { matchers, prefixSrc: PILL_MODEL_PREFIX.source, captionSrc: TIER_CAPTION_RE.source, triggerSel: TIER_TRIGGER_SEL })
+    .catch(() => ({ level: null, pillText: '' }));
 }
 
 // One Escape closes ONE layer. The tier control nests (popover → Advanced → Effort submenu),
@@ -2723,7 +2716,7 @@ const EFFORT_RE = new RegExp(`^(effort|усили[ея][а-яёА-ЯЁ]*|уро�
 // detector report success and then click nothing.
 async function readPopoverShape(p) {
   const slider = await readSliderState(p);
-  const rows = await p.evaluate(({ advancedSrc, effortSrc }) => {
+  const rows = await p.evaluate(({ advancedSrc, effortSrc, triggerSel }) => {
     const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const ADV = new RegExp(advancedSrc, 'i');
@@ -2737,7 +2730,7 @@ async function readPopoverShape(p) {
     )).filter(vis)
       // The composer pill shows the CURRENT level, so it matches the level pattern whether or
       // not the popover is open. Counting it would make "closed" look like "one item showing".
-      .filter((el) => !el.closest('.__composer-pill'));
+      .filter((el) => !el.closest(triggerSel) && !el.closest('[data-model-picker-view-toggle]'));
     let advanced = false;
     let effort = false;
     let levelItems = 0;
@@ -2750,7 +2743,7 @@ async function readPopoverShape(p) {
       else if (LEVELISH.test(first)) levelItems++;
     }
     return { advanced, effort, levelItems };
-  }, { advancedSrc: ADVANCED_RE.source, effortSrc: EFFORT_RE.source }).catch(() => ({ advanced: false, effort: false, levelItems: 0 }));
+  }, { advancedSrc: ADVANCED_RE.source, effortSrc: EFFORT_RE.source, triggerSel: TIER_TRIGGER_SEL }).catch(() => ({ advanced: false, effort: false, levelItems: 0 }));
   return { slider, ...rows };
 }
 
@@ -2804,8 +2797,8 @@ async function openIntelligenceMenu(p) {
   // just any popover).
   const pillText = /(instant|medium|high|extra high|very high|pro расширенн|pro extended|\bpro\b|мгновенн|средн|высок|очень высок)/i;
   const triggers = [
-    p.locator('.__composer-pill').last(),
-    p.locator('button').filter({ hasText: pillText }).last(),
+    p.locator(TIER_TRIGGER_VISIBLE_SEL).last(),
+    p.locator('button:visible').filter({ hasText: pillText }).last(),
     p.getByRole('button', { name: pillText }).last(),
   ];
   const activations = [
@@ -2813,8 +2806,14 @@ async function openIntelligenceMenu(p) {
     async (loc) => { await loc.focus(); await p.keyboard.press('Enter'); },
     async (loc) => { await loc.focus(); await p.keyboard.press('Space'); },
   ];
-  for (const loc of triggers) {
-    if (!await loc.isVisible({ timeout: 400 }).catch(() => false)) continue;
+  for (const [i, loc] of triggers.entries()) {
+    // A real wait, not isVisible() (which returns at once and ignores its timeout): right
+    // after the Chat/Work switch the composer re-lays itself out and the trigger is briefly
+    // not visible. The instant check skipped every trigger in that window and the tier was
+    // never set (2026-09-26); the primary trigger gets the longer budget.
+    const shown = await loc.waitFor({ state: 'visible', timeout: i === 0 ? 3000 : 500 })
+      .then(() => true).catch(() => false);
+    if (!shown) continue;
     for (const activate of activations) {
       try {
         await closeOpenMenus(p); // a stray open popover swallows the next activation
@@ -2830,7 +2829,7 @@ async function openIntelligenceMenu(p) {
   // once with the primary trigger first: the ladder above ends with an Escape-then-activate
   // cycle, so by now the popover is as likely closed as open and dumping would show nothing.
   await closeOpenMenus(p);
-  await p.locator('.__composer-pill').last().click({ timeout: 1500 }).catch(() => {});
+  await p.locator(TIER_TRIGGER_VISIBLE_SEL).last().click({ timeout: 1500 }).catch(() => {});
   await p.waitForTimeout(400).catch(() => {});
   const labels = await p.evaluate(() => {
     const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();

@@ -16,6 +16,7 @@ const { getContext, saveSession, clearSession, closeBrowser, maybeHideWebdriverO
 const { captureLoginFailure, redactSecrets, sanitizeUrl } = require('./login-diagnostics');
 const { gotoWithChallengeRetry } = require('./cf-navigate');
 const { waitForThroughChallenge, waitForAnyThroughChallenge } = require('./turnstile');
+const { COMPOSER_VISIBLE_SEL } = require('./composer-dom');
 
 // How long a post-submit field gets to appear.
 //
@@ -273,12 +274,12 @@ async function autoLogin(context) {
       });
     }
 
-    // Step 6: Wait for ChatGPT to be ready (prompt-textarea visible).
+    // Step 6: Wait for ChatGPT to be ready (composer editor visible).
     // NB: a visible composer is NOT proof of a session (ChatGPT renders it for anonymous
     // visitors too) — ensureLoggedIn() re-verifies against /api/auth/session afterwards.
     await step(page, 'chat-ready', async () => {
       console.log('[auto-login] Waiting for chat interface...');
-      const composer = page.locator('#prompt-textarea, textarea').first();
+      const composer = page.locator(COMPOSER_VISIBLE_SEL).first();
       // The same race as the email and password steps, and for the same reason — measured on
       // production 2026-07-27: Cloudflare challenges the post-password navigation as well.
       // The `400 Invalid content type` that the "Try again" below recovers from is that

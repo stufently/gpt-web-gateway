@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.14.5 — the 2026-09-26 chatgpt.com redesign (2026-09-26)
+
+From about 09:45 UTC every request failed: generations with 504 (`locator.waitFor: Timeout
+30000ms exceeded` while waiting for `#prompt-textarea`), edits with 503 (`no attachment preview
+after retries`), and the tier was never set (`Intelligence popover did not open`). ChatGPT had
+shipped a new composer and a new thread markup. `/health` stayed green: the page-load check
+also accepted any visible `<textarea>`.
+
+The selectors now live in `src/composer-dom.js`, current markup first and the previous
+generation as fallback:
+
+- **Editor**: ProseMirror `form[data-chatgpt-composer] [contenteditable][role=textbox]`
+  (`[data-composer-markdown]`); `#prompt-textarea` and `textarea[name=prompt]` stay as
+  fallbacks. Composer text is read through `.value` when the editor is a `<textarea>`.
+- **Page-load and new-chat checks** wait for that editor. A bare `textarea:visible` no longer
+  counts as a ready composer, in `src/auto-login.js` either.
+- **Send**: `form[data-chatgpt-composer] button[type=submit]` / `aria-label="Send"`.
+- **Attachments**: chips are counted and removed by `[data-composer-attachments]
+  button[aria-label^="Remove"]`; the button is now labelled `Remove <filename>`.
+- **Thread**: `[data-message-author-role]` is gone. User and assistant turns are also matched
+  by `[data-content-search-unit-key$=":user"|":assistant"]` (and `[data-user-message-bubble]`),
+  so the submit check, refusal scan and "not an image from the user turn" filter work again.
+- **Tier**: the trigger is `button[data-codex-intelligence-trigger]` (`Select ChatGPT model`,
+  text = current level). It is briefly not visible right after the Chat/Work switch, and the
+  old instant `isVisible()` check skipped it every time; the adapter now waits for it (3 s).
+  It is excluded from the popover's level-item count, as is the menu's `Select model` row.
+  The menu's 5-position power slider is driven by the existing slider path. When the menu
+  still does not open, the request goes on at the current tier, as before.
+
+Verified against the live account before release: one generation and one edit, both 200.
+
 ## 2.14.4 — multi-line prompts are typed as one message (2026-09-25)
 
 Every `/v1/images/edits` request with `aspect_ratio` failed from 2026-09-18 on, with
