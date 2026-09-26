@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: op1-gpt-web-gateway
     container: node:20
     env:
       # Tests import src modules that require playwright-extra at load time,
@@ -22,7 +22,7 @@ jobs:
         run: npm test
 
   docker:
-    runs-on: ubuntu-latest
+    runs-on: op1-gpt-web-gateway
     needs: test
     permissions:
       contents: read
