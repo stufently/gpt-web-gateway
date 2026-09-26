@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.14.6 — review fixes for 2.14.5 (2026-09-26)
+
+Three findings from a Codex review of 2.14.5.
+
+- **An earlier turn's picture is never returned as the new result.** When no new image had
+  rendered yet, the canvas fallback took the last large image on the page, including ones that
+  were there before submit. In a multi-turn conversation that answered the new request with the
+  previous picture. The code predates 2.14.5, but after the redesign the page has no
+  `div[id^="image-"]` containers, so every extraction takes this path. The fallback now reports
+  "not yet" and keeps polling. The only relaxation left is inside this turn's own image
+  container. The picker is a top-level page function (`canvasExtractInPage`) with tests.
+- **"Image created" only counts in the assistant's reply.** The success phrases were matched
+  against the body tail, which includes the user's own prompt. They are now matched in the last
+  assistant turn when the page exposes turns, and in the tail otherwise. Also predates 2.14.5.
+- **A `<textarea>` composer is read through `.value` only.** 2.14.5 returned the textarea's
+  `textContent` (its initial markup) whenever it was non-empty. `inputValue()` now goes first
+  and `textContent` is used only for non-form editors such as ProseMirror.
+
 ## 2.14.5 — the 2026-09-26 chatgpt.com redesign (2026-09-26)
 
 From about 09:45 UTC every request failed: generations with 504 (`locator.waitFor: Timeout

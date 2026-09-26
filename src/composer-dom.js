@@ -76,15 +76,18 @@ function stripTierCaption(text) {
 }
 
 // Text currently in the composer. ProseMirror keeps it in the DOM (textContent), a
-// <textarea> in `.value` — textContent of a textarea is only its initial markup.
+// <textarea> in `.value` — textContent of a textarea is only its initial markup, so for a
+// textarea it must never win, even when non-empty. inputValue() goes first and throws for
+// anything that is not a form control (the ProseMirror div); only then textContent.
 async function readComposerText(loc) {
-  const t = await loc.textContent();
-  if (t) return t;
+  let value;
   try {
-    return await loc.inputValue({ timeout: 1000 });
+    value = await loc.inputValue({ timeout: 1000 });
   } catch {
-    return t;
+    value = undefined;
   }
+  if (typeof value === 'string') return value;
+  return await loc.textContent();
 }
 
 module.exports = {

@@ -100,6 +100,61 @@ for (const [name, banner] of [
   check('assistant image → success', outcome, 'success');
 }
 
+// 6a. "Image created" typed by the USER (it is in the body tail, inside the user turn) is not
+// a success signal once the assistant turn is readable — only the assistant's own text counts.
+{
+  const outcome = withDocument(
+    {
+      bodyText: 'Draw a sign that says "Image created"\nThinking…',
+      assistantTurns: [{ innerText: 'Thinking…' }],
+    },
+    () => imageOutcomePredicate(EMPTY_PREV)
+  );
+  check('"image created" in the user prompt keeps polling', outcome, false);
+}
+{
+  const outcome = withDocument(
+    { bodyText: 'Draw a cat\nImage created', assistantTurns: [{ innerText: 'Image created' }] },
+    () => imageOutcomePredicate(EMPTY_PREV)
+  );
+  check('"image created" from the assistant → success', outcome, 'success');
+}
+
+// 6b. canvasExtractInPage must never hand back an image that was on the page before submit
+// (a previous turn's result) when nothing new has rendered yet.
+function withCanvasDocument({ imgs = [], containers = {} }, fn) {
+  global.document = {
+    querySelectorAll: () => imgs,
+    getElementById: (id) => containers[id] || null,
+    createElement: () => ({
+      getContext: () => ({ drawImage: () => {} }),
+      toDataURL: () => 'data:image/png;base64,QUJD',
+    }),
+  };
+  try { return fn(); } finally { delete global.document; }
+}
+const { canvasExtractInPage } = _test;
+{
+  const old = { ...makeElement({ src: 'blob:previous-turn' }), complete: true };
+  const r = withCanvasDocument({ imgs: [old] },
+    () => canvasExtractInPage({ targetId: null, prevSrcs: ['blob:previous-turn'] }));
+  check('canvas: only a pre-submit image on the page → not returned', !!r.error && !r.b64, true);
+}
+{
+  const old = { ...makeElement({ src: 'blob:previous-turn' }), complete: true };
+  const fresh = { ...makeElement({ src: 'blob:this-turn' }), complete: true };
+  const r = withCanvasDocument({ imgs: [old, fresh] },
+    () => canvasExtractInPage({ targetId: null, prevSrcs: ['blob:previous-turn'] }));
+  check('canvas: a new image is extracted', r.src, 'blob:this-turn');
+}
+{
+  const inside = { ...makeElement({ src: 'blob:re-rendered' }), complete: true };
+  const container = { querySelectorAll: () => [inside] };
+  const r = withCanvasDocument({ imgs: [inside], containers: { 'image-new': container } },
+    () => canvasExtractInPage({ targetId: 'image-new', prevSrcs: ['blob:re-rendered'] }));
+  check('canvas: inside the new container a seen src is still this turn', r.src, 'blob:re-rendered');
+}
+
 // 7. reuseChat: an OLD refusal already present in the pre-submit tail must not abort
 // the new turn (banner is not "new") — both content-policy and guardrails variants.
 for (const [name, banner] of [

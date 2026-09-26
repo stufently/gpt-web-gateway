@@ -1703,6 +1703,60 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
   throw err;
 }
 
+// Page-context image picker + canvas export for the extraction fallback. Top-level and
+// self-contained (it runs in the browser) so scripts/test-refusal-detect.js can drive it
+// with a DOM stub. Never returns an image that was already on the page before submit,
+// except from inside this turn's own image container (`targetId`).
+function canvasExtractInPage({ targetId, prevSrcs }) {
+  const scope = targetId ? document.getElementById(targetId) : document;
+  const imgs = scope ? scope.querySelectorAll('img') : document.querySelectorAll('img');
+  // Walk from end → first valid is the newest
+  const all = Array.from(imgs);
+  // Never extract images from USER turns — those are the caller's own uploaded
+  // attachments (an edit request must not "succeed" by returning the input image).
+  const inUserTurn = (img) => !!(img.closest && img.closest('[data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-user-message-bubble]'));
+  let bestImg = null;
+  for (let j = all.length - 1; j >= 0; j--) {
+    const img = all[j];
+    if (img.naturalWidth <= 200 || img.naturalHeight <= 200 || !img.src) continue;
+    if (img.src.startsWith('data:image/svg')) continue;
+    if (inUserTurn(img)) continue;
+    // Skip images we already saw before submit (avoid stale extraction)
+    if (prevSrcs.includes(img.src)) continue;
+    bestImg = img;
+    break;
+  }
+  // Nothing new yet. The only safe relaxation is INSIDE the new image container: whatever
+  // sits there belongs to this turn even if its src was seen before. Page-wide, an
+  // already-present image is an earlier turn's result — returning it would answer a
+  // multi-turn request with the previous picture (Codex review, 2026-09-26). Report
+  // "not yet" instead and let the caller poll again.
+  if (!bestImg && targetId && scope) {
+    const own = Array.from(scope.querySelectorAll('img'));
+    for (let j = own.length - 1; j >= 0; j--) {
+      const img = own[j];
+      if (img.naturalWidth <= 200 || img.naturalHeight <= 200 || !img.src) continue;
+      if (img.src.startsWith('data:image/svg')) continue;
+      if (inUserTurn(img)) continue;
+      bestImg = img;
+      break;
+    }
+  }
+  if (!bestImg) return { error: 'No new large image found yet' };
+  if (!bestImg.complete) return { error: 'Image still loading' };
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = bestImg.naturalWidth;
+    canvas.height = bestImg.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bestImg, 0, 0);
+    const dataUrl = canvas.toDataURL('image/png');
+    return { b64: dataUrl.split(',')[1], contentType: 'image/png', src: bestImg.src };
+  } catch (e) {
+    return { error: e.message, src: bestImg.src };
+  }
+}
+
 // Page-context predicate for waitForFunction. Returns one of:
 // 'success' | 'policy' | 'refused' | 'limit' | false (keep polling).
 // Lifted out so adaptive retry can reuse the exact same logic.
@@ -1764,8 +1818,11 @@ function imageOutcomePredicate({ previousImageIds, previousLargeImages, previous
   }
 
   // --- Success -------------------------------------------------------------------------
-  if (tailChanged && (tailIsNew('image created') || tailIsNew('images created'))) return 'success';
-  if (tailChanged && (tailIsNew('изображение создано') || tailIsNew('изображения созданы'))) return 'success';
+  // Scanned in the last ASSISTANT turn (scanNorm), not the body tail: a prompt that says
+  // "image created" sits in the user turn and must not confirm anything. Without readable
+  // turns scanNorm is the tail, i.e. the old behaviour.
+  if (tailChanged && (isNew('image created') || isNew('images created'))) return 'success';
+  if (tailChanged && (isNew('изображение создано') || isNew('изображения созданы'))) return 'success';
   if (hasNewImageId || hasNewLargeImage) return 'success';
 
   // Rate-limit banner is rendered as a system notice (not necessarily an assistant
@@ -2228,52 +2285,7 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
   const previousLargeImages = beforeState.largeImages || [];
   console.log('Extracting image via canvas...');
   for (let i = 0; i < 12; i++) {
-    const result = await p.evaluate(({ targetId, prevSrcs }) => {
-      const scope = targetId ? document.getElementById(targetId) : document;
-      const imgs = scope ? scope.querySelectorAll('img') : document.querySelectorAll('img');
-      // Walk from end → first valid is the newest
-      const all = Array.from(imgs);
-      // Never extract images from USER turns — those are the caller's own uploaded
-      // attachments (an edit request must not "succeed" by returning the input image).
-      const inUserTurn = (img) => !!(img.closest && img.closest('[data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-user-message-bubble]'));
-      let bestImg = null;
-      for (let j = all.length - 1; j >= 0; j--) {
-        const img = all[j];
-        if (img.naturalWidth <= 200 || img.naturalHeight <= 200 || !img.src) continue;
-        if (img.src.startsWith('data:image/svg')) continue;
-        if (inUserTurn(img)) continue;
-        // Skip images we already saw before submit (avoid stale extraction)
-        if (prevSrcs.includes(img.src)) continue;
-        bestImg = img;
-        break;
-      }
-      // If no "new" image found, fall back to last large img anywhere
-      if (!bestImg) {
-        const anyImgs = document.querySelectorAll('img');
-        const flat = Array.from(anyImgs);
-        for (let j = flat.length - 1; j >= 0; j--) {
-          const img = flat[j];
-          if (img.naturalWidth <= 200 || img.naturalHeight <= 200 || !img.src) continue;
-          if (img.src.startsWith('data:image/svg')) continue;
-          if (inUserTurn(img)) continue;
-          bestImg = img;
-          break;
-        }
-      }
-      if (!bestImg) return { error: 'No large image found' };
-      if (!bestImg.complete) return { error: 'Image still loading' };
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = bestImg.naturalWidth;
-        canvas.height = bestImg.naturalHeight;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(bestImg, 0, 0);
-        const dataUrl = canvas.toDataURL('image/png');
-        return { b64: dataUrl.split(',')[1], contentType: 'image/png', src: bestImg.src };
-      } catch (e) {
-        return { error: e.message, src: bestImg.src };
-      }
-    }, { targetId: newImageId, prevSrcs: previousLargeImages });
+    const result = await p.evaluate(canvasExtractInPage, { targetId: newImageId, prevSrcs: previousLargeImages });
 
     if (!result.error) {
       console.log('Canvas extraction successful.');
@@ -4108,6 +4120,7 @@ module.exports = {
     imageOutcomePredicate,
     setThinkingMode,
     waitAndExtractImage,
+    canvasExtractInPage,
     menuFailures: () => consecutiveMenuFailures,
     resetMenuFailures: () => { consecutiveMenuFailures = 0; },
   },

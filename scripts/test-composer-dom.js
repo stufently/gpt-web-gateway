@@ -48,6 +48,16 @@ async function test(name, fn) { await fn(); console.log(`PASS: ${name}`); passed
     assert.strictEqual(await dom.readComposerText(loc), 'typed');
   });
 
+  await test('readComposerText prefers a <textarea> value over stale non-empty textContent', async () => {
+    const loc = { textContent: async () => 'initial markup', inputValue: async () => 'typed' };
+    assert.strictEqual(await dom.readComposerText(loc), 'typed');
+  });
+
+  await test('readComposerText returns an EMPTY textarea value, not its textContent', async () => {
+    const loc = { textContent: async () => 'initial markup', inputValue: async () => '' };
+    assert.strictEqual(await dom.readComposerText(loc), '');
+  });
+
   await test('readComposerText survives a locator without inputValue', async () => {
     assert.strictEqual(await dom.readComposerText({ textContent: async () => '' }), '');
   });
