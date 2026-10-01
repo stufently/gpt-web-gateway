@@ -13,11 +13,14 @@
   "dependencies": {
     "dotenv": "^16.4.0",
     "express": "^4.21.0",
-    "multer": "^2.1.1",
+    "multer": "2.3.0",
     "patchright": "1.61.1",
     "playwright": "^1.49.0",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "uuid": "^11.0.0"
+  },
+  "overrides": {
+    "brace-expansion": "1.1.20"
   }
 }
