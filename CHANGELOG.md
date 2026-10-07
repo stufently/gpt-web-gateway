@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Auto-login waits up to 30s (`TOTP_PROMPT_TIMEOUT_SEC`) for a TOTP field or an
+  MFA page, and fills either one code input or six one-digit boxes. A missing
+  field on the MFA page, and a code the host rejects (`error=totp`), fail the
+  step instead of continuing into chat-ready. A browser that is already on the
+  chat app does not spend that budget.
+
 ## 2.14.7 — 2026-10-07
 
 - Text extraction recognizes the current Chat UI `Stop` button, so a quiet prefix

@@ -17,6 +17,7 @@ const { captureLoginFailure, redactSecrets, sanitizeUrl } = require('./login-dia
 const { gotoWithChallengeRetry } = require('./cf-navigate');
 const { waitForThroughChallenge, waitForAnyThroughChallenge } = require('./turnstile');
 const { COMPOSER_VISIBLE_SEL } = require('./composer-dom');
+const { fillTotpStep } = require('./totp-step');
 
 // How long a post-submit field gets to appear.
 //
@@ -253,24 +254,11 @@ async function autoLogin(context) {
       console.log('[auto-login] Submitted password');
     });
 
-    // Step 5: TOTP (if prompted)
+    // Step 5: TOTP (if a secret is configured). The wait and the field search live
+    // in totp-step.js; this wrapper only makes a miss or a rejected code a diagnosed failure.
     if (totpSecret) {
       await step(page, 'totp', async () => {
-        const otpInput = page.locator(
-          'input[name="code"], input[autocomplete="one-time-code"], input[type="text"][maxlength="6"]'
-        ).first();
-        const totpRequired = await otpInput.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false);
-        if (totpRequired) {
-          const token = generateTOTP(totpSecret);
-          console.log('[auto-login] Entering TOTP code...');
-          await otpInput.fill(token);
-          const totpSubmit = page.locator('button[type="submit"]').first();
-          await totpSubmit.waitFor({ state: 'visible', timeout: 10000 });
-          await totpSubmit.click();
-          console.log('[auto-login] Submitted TOTP');
-        } else {
-          console.log('[auto-login] TOTP prompt not found — skipping');
-        }
+        await fillTotpStep(page, totpSecret, { generateTOTP });
       });
     }
 
