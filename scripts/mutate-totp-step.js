@@ -1,4 +1,4 @@
-// Kills four regressions in src/totp-step.js. rc=0 only when each mutation is
+// Kills tracked regressions in src/totp-step.js. rc=0 only when each mutation is
 // present exactly once, turns its own test into an AssertionError, and the
 // original bytes are restored (sha256).
 const crypto = require('crypto');
@@ -51,6 +51,60 @@ const mutations = [
       '  }',
     ].join('\n'),
     to: '',
+  },
+  {
+    id: 'M03',
+    test: 'a field that becomes visible exactly at the deadline is not filled',
+    from: 'while (now() < deadline)',
+    to: 'while (now() <= deadline)',
+  },
+  {
+    id: 'M04',
+    test: 'the last pause stops at the budget instead of a full poll',
+    from: 'const slice = Math.min(POLL_MS, deadline - now());',
+    to: 'const slice = POLL_MS;',
+  },
+  {
+    id: 'M17',
+    test: 'an auth0.com MFA url with no code field throws login_form_changed',
+    from: 'return /auth\\.openai\\.com|auth0\\.com/i.test(String(url || \'\'));',
+    to: 'return /auth\\.openai\\.com/i.test(String(url || \'\'));',
+  },
+  {
+    id: 'M18',
+    test: 'chat.openai.com is already the app and the step skips',
+    from: 'return /chatgpt\\.com|chat\\.openai\\.com/i.test(value);',
+    to: 'return /chatgpt\\.com/i.test(value);',
+  },
+  {
+    id: 'M25',
+    test: 'Enter is pressed on the last segment when submit is missing',
+    from: 'await submitCode(page, found.fields[found.fields.length - 1]);',
+    to: 'await submitCode(page, found.fields[0]);',
+  },
+  {
+    id: 'M26',
+    test: 'a generator result that is not six digits is rejected',
+    from: 'if (!/^\\d{6}$/.test(code))',
+    to: 'if (false)',
+  },
+  {
+    id: 'M27',
+    test: 'a numeric generator result is filled as six digit characters',
+    from: 'const code = String(generate(secret) ?? \'\');',
+    to: 'const code = generate(secret);',
+  },
+  {
+    id: 'M30',
+    test: 'a hung field probe still ends when the budget ends',
+    from: 'Math.max(1, remainingMs)',
+    to: 'Math.max(1, remainingMs * 2)',
+  },
+  {
+    id: 'M31',
+    test: 'a code with a leading zero is entered unchanged',
+    from: 'const code = String(generate(secret) ?? \'\');',
+    to: 'const code = String(Number(generate(secret) ?? \'\'));',
   },
 ];
 
@@ -130,4 +184,4 @@ if (failed) {
   console.error(`${failed} mutation(s) were not killed`);
   process.exit(1);
 }
-console.log('all four mutations killed');
+console.log(`all ${mutations.length} mutations killed`);

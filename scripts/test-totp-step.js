@@ -37,6 +37,7 @@ function fakePage(opts = {}) {
     url: opts.url || 'https://chatgpt.com/',
     fills: [],
     presses: [],
+    pressFields: [],
     clicks: [],
     logs: [],
   };
@@ -77,7 +78,10 @@ function fakePage(opts = {}) {
           maxlength: el.maxlength || null,
         });
       },
-      async press(key) { state.presses.push(key); },
+      async press(key) {
+        state.presses.push(key);
+        state.pressFields.push(el && el.id != null ? el.id : null);
+      },
       async click() {
         state.clicks.push(el.id || el.type || 'button');
         if (typeof opts.urlAfterSubmit === 'string') state.url = opts.urlAfterSubmit;
@@ -371,6 +375,14 @@ async function fill(env, opts) {
 
   await check('a hung field probe still ends when the budget ends', async () => {
     process.env.TOTP_PROMPT_TIMEOUT_SEC = '1';
+    const delays = [];
+    const origSetTimeout = global.setTimeout;
+    // The probe timer is a real setTimeout. Record the delay it asks for so a
+    // doubled timer fails even when the wall clock is late.
+    global.setTimeout = (fn, ms, ...args) => {
+      delays.push(Number(ms));
+      return origSetTimeout(fn, ms, ...args);
+    };
     try {
       const env = fakePage({ url: 'https://auth.openai.com/login', bodyText: 'hello' });
       const orig = env.page.locator.bind(env.page);
@@ -392,8 +404,11 @@ async function fill(env, opts) {
       const elapsed = Date.now() - started;
       assert.ok(elapsed >= 900, `returned in ${elapsed}ms`);
       assert.ok(elapsed < 8000, `hung for ${elapsed}ms`);
+      const probeDelay = Math.max(...delays);
+      assert.ok(probeDelay >= 900 && probeDelay < 1500, `probe timer ${probeDelay}ms`);
       assert.ok(env.state.logs.some((line) => line.includes('TOTP prompt not found — skipping')));
     } finally {
+      global.setTimeout = origSetTimeout;
       delete process.env.TOTP_PROMPT_TIMEOUT_SEC;
     }
   });
@@ -481,6 +496,133 @@ async function fill(env, opts) {
     await fillTotpStep(env.page, secret, { now: env.now, log: env.log });
     assert.match(expected, /^\d{6}$/);
     assert.deepStrictEqual(env.state.fills.map((f) => f.value), [expected]);
+  });
+
+  await check('an auth0.com MFA url with no code field throws login_form_changed', async () => {
+    // auth0.com is an auth host. A challenge there with no field is a broken step.
+    const env = fakePage({
+      url: 'https://tenant.auth0.com/mfa-challenge',
+      bodyText: '',
+      inputs: [],
+      buttons: [],
+    });
+    await assert.rejects(
+      () => fill(env),
+      (err) => {
+        assert.strictEqual(err.loginBlockerHint, 'login_form_changed');
+        return true;
+      },
+    );
+    assert.deepStrictEqual(env.state.fills, []);
+    assert.ok(env.state.clock >= 30000, `failed at ${env.state.clock}ms`);
+  });
+
+  await check('chat.openai.com is already the app and the step skips', async () => {
+    const env = fakePage({
+      url: 'https://chat.openai.com/',
+      bodyText: 'How can I help you?',
+      inputs: [],
+    });
+    const state = await fill(env);
+    assert.deepStrictEqual(state.fills, []);
+    assert.ok(state.logs.some((line) => line.includes('TOTP prompt not found — skipping')));
+    assert.ok(state.clock < 1000, `waited ${state.clock}ms on chat.openai.com`);
+  });
+
+  await check('Enter is pressed on the last segment when submit is missing', async () => {
+    const env = fakePage({
+      url: 'https://auth.openai.com/mfa-challenge',
+      inputs: Array.from({ length: 6 }, (_, i) => ({ maxlength: '1', visible: true, id: i })),
+      buttons: [],
+    });
+    const state = await fill(env);
+    assert.deepStrictEqual(state.fills.map((f) => f.value), CODE.split(''));
+    assert.deepStrictEqual(state.clicks, []);
+    assert.deepStrictEqual(state.presses, ['Enter']);
+    assert.deepStrictEqual(state.pressFields, [5]);
+  });
+
+  await check('a generator result that is not six digits is rejected', async () => {
+    for (const bad of ['12345', '1234567', 'abcdef', null, undefined]) {
+      const env = withField({ name: 'code', visible: true });
+      await assert.rejects(
+        () => fill(env, { generateTOTP: () => bad }),
+        (err) => {
+          assert.strictEqual(err.message, 'TOTP generator did not return a 6-digit code');
+          return true;
+        },
+      );
+      assert.deepStrictEqual(env.state.fills, [], `filled ${JSON.stringify(bad)}`);
+      assert.deepStrictEqual(env.state.clicks, []);
+      assert.deepStrictEqual(env.state.presses, []);
+    }
+  });
+
+  await check('a numeric generator result is filled as six digit characters', async () => {
+    // Six boxes call charAt. A number must be turned into a string before that.
+    const env = fakePage({
+      url: 'https://auth.openai.com/mfa-challenge',
+      inputs: Array.from({ length: 6 }, () => ({ maxlength: '1', visible: true })),
+      buttons: [{ type: 'submit', visible: true }],
+    });
+    let error = null;
+    try {
+      await fill(env, { generateTOTP: () => 123456 });
+    } catch (e) {
+      error = e;
+    }
+    assert.strictEqual(error, null);
+    assert.deepStrictEqual(env.state.fills.map((f) => f.value), ['1', '2', '3', '4', '5', '6']);
+  });
+
+  await check('a code with a leading zero is entered unchanged', async () => {
+    const env = withField({ name: 'code', visible: true });
+    let error = null;
+    try {
+      await fill(env, { generateTOTP: () => '012345' });
+    } catch (e) {
+      error = e;
+    }
+    assert.strictEqual(error, null);
+    assert.deepStrictEqual(env.state.fills.map((f) => f.value), ['012345']);
+    assert.deepStrictEqual(env.state.clicks, ['submit']);
+  });
+
+  await check('a field that becomes visible exactly at the deadline is not filled', async () => {
+    // The wait is `now < deadline`. A field that appears on the boundary is too late.
+    process.env.TOTP_PROMPT_TIMEOUT_SEC = '2';
+    try {
+      const env = fakePage({
+        url: 'https://auth.openai.com/login',
+        bodyText: 'hello',
+        inputs: [{ name: 'code', visible: (clock) => clock >= 2000 }],
+        buttons: [{ type: 'submit', visible: true }],
+      });
+      const state = await fill(env);
+      assert.deepStrictEqual(state.fills, []);
+      assert.strictEqual(state.clock, 2000);
+      assert.ok(state.logs.some((line) => line.includes('TOTP prompt not found — skipping')));
+    } finally {
+      delete process.env.TOTP_PROMPT_TIMEOUT_SEC;
+    }
+  });
+
+  await check('the last pause stops at the budget instead of a full poll', async () => {
+    // 750ms is not a multiple of the 500ms poll. The tail wait is the remainder.
+    process.env.TOTP_PROMPT_TIMEOUT_SEC = '0.75';
+    try {
+      const env = fakePage({
+        url: 'https://auth.openai.com/login',
+        bodyText: 'hello',
+        inputs: [],
+      });
+      const state = await fill(env);
+      assert.deepStrictEqual(state.fills, []);
+      assert.strictEqual(state.clock, 750, `waited ${state.clock}ms`);
+      assert.ok(state.logs.some((line) => line.includes('TOTP prompt not found — skipping')));
+    } finally {
+      delete process.env.TOTP_PROMPT_TIMEOUT_SEC;
+    }
   });
 
   await check('auto-login delegates the TOTP step to fillTotpStep', async () => {
