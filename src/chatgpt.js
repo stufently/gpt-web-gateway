@@ -1453,7 +1453,13 @@ async function captureTextState(p) {
             return text && !/^\s*(you|вы)\s*$/i.test(text);
           });
       return nodes
-        .map(el => (el.innerText || '').replace(/\n{3,}/g, '\n\n').trim())
+        .map(el => {
+          // The current UI wraps markdown with an sr-only "ChatGPT said:" heading.
+          // Read the answer element so accessibility labels never enter API content.
+          const content = el.querySelector('[data-markdown-text-style="assistant-message"]')
+            || el.querySelector('.markdown') || el;
+          return (content.innerText || '').replace(/\n{3,}/g, '\n\n').trim();
+        })
         .filter(Boolean);
     };
 
@@ -1498,7 +1504,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
   }
   let deadline = start + baseBudgetMs;
   let extended = false;
-  const STOP_BTN_SELECTOR = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Остановить"]';
+  const STOP_BTN_SELECTOR = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"], button[aria-label="Остановить"]';
 
   // Stuck-generation guard state: any observable change in the assistant text or body tail
   // counts as progress. See CHAT_STALL_WINDOW_MS. Thinking modes get a doubled window —
@@ -1696,7 +1702,8 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
     await p.waitForTimeout(1000);
   }
 
-  if (bestText) return { text: bestText, conversationId: conversationIdFromUrl(p.url()) };
+  // A visible prefix is not a completed answer. Reaching the deadline must never
+  // turn an unfinished generation into HTTP 200 with finish_reason="stop".
   await saveDebugSnapshot(p, 'text_timeout').catch(() => {});
   const err = new Error('ChatGPT did not return a text response in time');
   err.code = 'timeout';

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.14.7 — 2026-10-07
+
+- Text extraction recognizes the current Chat UI `Stop` button, so a quiet prefix
+  during generation cannot be mistaken for a completed response.
+- Read assistant markdown separately from the screen-reader speaker heading;
+  structured JSON replies reach API clients without the `ChatGPT said:` label.
+- An expired response deadline returns a timeout instead of a partial successful
+  completion. Four regression cases cover the current UI and legacy content.
+
 ## 2.14.6 — review fixes for 2.14.5 (2026-09-26)
 
 Three findings from a Codex review of 2.14.5.
