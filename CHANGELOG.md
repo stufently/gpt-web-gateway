@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.14.8 — 2026-10-07
+
+- Auto-login TOTP step moved to `src/totp-step.js`: waits up to
+  `TOTP_PROMPT_TIMEOUT_SEC` (30 s) for a single or six-box code field, and fails
+  closed with `login_form_changed` when an MFA page shows no field instead of
+  silently skipping the code.
+- Tests cover auth0/chat.openai.com hosts, Enter on the last box, non-6-digit and
+  leading-zero codes, and deadline edges; 13 mutations of the step are killed.
+
 ## Unreleased
 
 - Auto-login waits up to 30s (`TOTP_PROMPT_TIMEOUT_SEC`) for a TOTP field or an
