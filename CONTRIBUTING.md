@@ -16,10 +16,10 @@ Thanks for your interest in gpt-web-gateway!
 
 ```bash
 # Install deps once (no browser download needed for tests)
-docker run --rm -v "$PWD":/app -w /app -e PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 node:20-slim npm ci --omit=dev
+docker run --rm -v "$PWD":/app -w /app -e PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 node:24-slim npm ci --omit=dev
 
 # Run tests (pure node:assert scripts, no browser needed)
-docker run --rm -v "$PWD":/app -w /app node:20-slim npm test
+docker run --rm -v "$PWD":/app -w /app node:24-slim npm test
 
 # Build the image
 docker build -t gpt-web-gateway .

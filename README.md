@@ -429,10 +429,10 @@ See [SECURITY.md](SECURITY.md) for security notes and reporting.
 ```bash
 # Install deps once (tests import modules that require playwright-extra,
 # but never launch a browser — skip the browser download)
-docker run --rm -v "$PWD":/app -w /app -e PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 node:20-slim npm ci --omit=dev
+docker run --rm -v "$PWD":/app -w /app -e PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 node:24-slim npm ci --omit=dev
 
 # Run tests (pure node:assert scripts, no browser needed)
-docker run --rm -v "$PWD":/app -w /app node:20-slim npm test
+docker run --rm -v "$PWD":/app -w /app node:24-slim npm test
 ```
 
 ## License

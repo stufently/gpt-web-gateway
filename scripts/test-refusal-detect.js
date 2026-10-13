@@ -1,6 +1,6 @@
 // Regression test for imageOutcomePredicate (src/chatgpt.js) — UI refusal banners,
 // typographic apostrophes, and user-turn image filtering (edit-flow false success).
-// Run with: docker run --rm -v $PWD:/app -w /app node:20-slim node scripts/test-refusal-detect.js
+// Run with: docker run --rm -v $PWD:/app -w /app node:24-slim node scripts/test-refusal-detect.js
 const assert = require('node:assert');
 
 // ---- Minimal DOM stub ------------------------------------------------------

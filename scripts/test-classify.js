@@ -1,5 +1,5 @@
 // Regression test for src/metrics.js classifyError + observeDuration histogram.
-// Run with: docker run --rm -v $PWD:/app -w /app node:20-slim node scripts/test-classify.js
+// Run with: docker run --rm -v $PWD:/app -w /app node:24-slim node scripts/test-classify.js
 const assert = require('node:assert');
 const {
   classifyError,
