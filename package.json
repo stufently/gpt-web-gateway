@@ -8,11 +8,11 @@
     "dev": "node --watch src/server.js",
     "login": "node src/login.js",
     "auto-login": "node src/auto-login.js",
-    "test": "node scripts/test-auth.js && node scripts/test-composer-dom.js && node scripts/test-classify.js && node scripts/test-params.js && node scripts/test-tiers.js && node scripts/test-progress.js && node scripts/test-pacer.js && node scripts/test-job-pool.js && node scripts/test-fill-timeout.js && node scripts/test-multiline-typing.js && node scripts/test-cooldown.js && node scripts/test-refusal-detect.js && node scripts/test-conversation-read.js && node scripts/test-conversation-trim.js && node scripts/test-sse-transform.js && node scripts/test-session-health.js && node scripts/test-login-diagnostics.js && node scripts/test-session-check.js && node scripts/test-browser-fingerprint.js && node scripts/test-cloudflare.js && node scripts/test-cf-navigate.js && node scripts/test-turnstile.js && node scripts/test-text-extraction.js && node scripts/test-totp-step.js && node scripts/test-parallel-slots.js && node scripts/test-parallel-routes.js"
+    "test": "node scripts/test-auth.js && node scripts/test-composer-dom.js && node scripts/test-classify.js && node scripts/test-params.js && node scripts/test-tiers.js && node scripts/test-progress.js && node scripts/test-pacer.js && node scripts/test-job-pool.js && node scripts/test-fill-timeout.js && node scripts/test-multiline-typing.js && node scripts/test-cooldown.js && node scripts/test-refusal-detect.js && node scripts/test-conversation-read.js && node scripts/test-conversation-trim.js && node scripts/test-sse-transform.js && node scripts/test-session-health.js && node scripts/test-login-diagnostics.js && node scripts/test-session-check.js && node scripts/test-browser-fingerprint.js && node scripts/test-cloudflare.js && node scripts/test-cf-navigate.js && node scripts/test-turnstile.js && node scripts/test-text-extraction.js && node scripts/test-totp-step.js && node scripts/test-parallel-slots.js && node scripts/test-parallel-routes.js && node scripts/test-express5-compat.js"
   },
   "dependencies": {
     "dotenv": "^16.4.0",
-    "express": "^4.21.0",
+    "express": "^5.3.0",
     "multer": "2.4.0",
     "patchright": "1.61.1",
     "playwright": "^1.49.0",

@@ -7,6 +7,7 @@ const loginRouter = require('./routes/login');
 const { metricsHandler } = require('./metrics');
 const { progress } = require('./progress');
 const { createAuthMiddleware } = require('./auth');
+const { defaultBody } = require('./body-default');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -49,6 +50,7 @@ if (API_KEY) {
 }
 
 app.use(express.json({ limit: '50mb' }));
+app.use(defaultBody);
 
 // Serve static files (frontend + generated images)
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -78,7 +80,11 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: { message: err.message, type: 'server_error' } });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, (err) => {
+  // Express 5 hands listen errors (EADDRINUSE, ...) to this callback instead of
+  // emitting 'error' unhandled; rethrow so the process dies as it did on Express 4
+  // rather than warming up a browser behind a server that never bound.
+  if (err) throw err;
   console.log(`gpt-web-gateway running on http://localhost:${PORT}`);
   console.log(`POST http://localhost:${PORT}/v1/images/generations`);
   // Proactively warm up the ChatGPT session at boot (non-blocking, best-effort) instead of

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Express 4 → 5.3.0. Routes use no wildcard/optional paths and never write
+  `req.query`, so they work unchanged.
+- Express 5 leaves `req.body` undefined for a POST without a JSON body; a new
+  `defaultBody` middleware restores `{}` so such requests keep getting the
+  routes' own 400 (`prompt is required`, …) instead of a 500 TypeError.
+- The `app.listen` callback rethrows its error: under Express 5 `EADDRINUSE`
+  lands there and was silently ignored.
+
 ## 2.15.0 — 2026-10-15
 
 - Up to `MAX_CONCURRENT_JOBS` jobs (1..5, default 3) now run at once, each on
