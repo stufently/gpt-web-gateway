@@ -153,7 +153,9 @@ const EMPTY_TURN_RETRY_MIN_MS = safePositiveInt(process.env.CHAT_EMPTY_TURN_RETR
 // One more resend after the same-mode ones (2.16.9), in instant mode: an empty turn is a turn
 // with reasoning only, and instant has no reasoning phase. Same rules and budget as the others;
 // the client sees it as applied.thinking_mode "instant" + thinking_fallback reason "empty_turn".
-const EMPTY_TURN_INSTANT_RETRY = safeNonNegativeInt(process.env.CHAT_EMPTY_TURN_INSTANT_RETRY, 1) > 0 ? 1 : 0;
+// It follows a same-mode resend only: CHAT_EMPTY_TURN_RETRIES=0 still turns every resend off.
+const EMPTY_TURN_INSTANT_RETRY = EMPTY_TURN_RETRIES > 0
+  && safeNonNegativeInt(process.env.CHAT_EMPTY_TURN_INSTANT_RETRY, 1) > 0 ? 1 : 0;
 const EMPTY_TURN_RETRIES_TOTAL = EMPTY_TURN_RETRIES + EMPTY_TURN_INSTANT_RETRY;
 function emptyTurnRetryLabel(n) {
   return `${n}/${EMPTY_TURN_RETRIES_TOTAL}${n > EMPTY_TURN_RETRIES ? ' (instant)' : ''}`;
@@ -4671,6 +4673,14 @@ async function completeText(prompt, options = {}) {
       const instantResend = (stallRetryState.emptyTurnUsed || 0) > EMPTY_TURN_RETRIES;
       const thinkingMode = instantResend ? 'instant' : requestedMode;
       const thinkingState = await setThinkingMode(p, thinkingMode);
+      // The instant resend exists for its mode: if the composer did not switch, do not send a
+      // third turn in the mode that just came back empty twice.
+      if (instantResend && thinkingState.mode !== 'instant') {
+        const notInstant = new Error(`ChatGPT ended the turn without an answer; the instant resend was not sent: the composer stayed on ${thinkingState.mode}`);
+        notInstant.code = 'empty_turn';
+        notInstant.resendNotSent = true;
+        throw notInstant;
+      }
 
       const beforeState = await captureTextState(p);
       // Prime BEFORE opening the capture, and the order is load-bearing twice over.

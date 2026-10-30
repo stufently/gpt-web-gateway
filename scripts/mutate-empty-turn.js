@@ -53,6 +53,8 @@ const mutations = [
   ['I10', C, 'if (err.resendNotSent) console.log(', 'if (false) console.log('],
   ['I11', C, 'const label = emptyTurnRetryLabel((stallRetryState.emptyTurnUsed || 0) + 1);', 'const label = emptyTurnRetryLabel(stallRetryState.emptyTurnUsed || 0);'],
   ['I12', C, "? { from: requestedMode, to: 'instant', reason: 'empty_turn'", "? { from: thinkingMode, to: 'instant', reason: 'empty_turn'"],
+  ['I13', C, "if (instantResend && thinkingState.mode !== 'instant') {", 'if (false) {'],
+  ['I14', C, 'const EMPTY_TURN_INSTANT_RETRY = EMPTY_TURN_RETRIES > 0\n  && ', 'const EMPTY_TURN_INSTANT_RETRY = '],
 ];
 
 const sha = b => crypto.createHash('sha256').update(b).digest('hex');

@@ -9,6 +9,8 @@ In 5 h of 2.16.8 the same-mode resend of an empty turn ran 10 times and saved th
   with reasoning only, and instant has no reasoning phase. Same rules as the first resend: not
   for `conversation_id` continuations, not after a streamed delta, only with
   `CHAT_EMPTY_TURN_RETRY_MIN_SEC` of the request budget left, and its wait is capped by it.
+  `CHAT_EMPTY_TURN_RETRIES=0` still turns every resend off. If the composer does not switch to
+  instant, the resend is not sent (a third turn in the mode that came back empty twice).
 - The client sees it in the metadata: `applied.thinking_mode: "instant"`,
   `requested_verified: false` and `thinking_fallback: {from, to: "instant", reason:
   "empty_turn"}` (no fallback marker when instant was what the caller asked for). The body is

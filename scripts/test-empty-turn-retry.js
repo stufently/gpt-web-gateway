@@ -568,3 +568,38 @@ test('a resend that was not sent for lack of budget does not start the instant r
     assert.doesNotMatch(output, /2\/2 \(instant\)/);
   });
 });
+
+test('CHAT_EMPTY_TURN_RETRIES=0 turns the instant resend off too', async () => {
+  await fixture({ ...ENV_INSTANT, CHAT_EMPTY_TURN_RETRIES: '0' }, async f => {
+    f.clock.now = NOW;
+    const p = withPill(scripted(f, [{ id: CONVERSATION, ...frozen }, { id: SECOND, poll: at => polled(turn(at, 'x')) }]), MEDIUM_THEN_INSTANT);
+    const { output } = await logs(() => assert.rejects(
+      f.chat.completeText('hello', { thinkingMode: 'standard', requestStartedAt: NOW }), e => e.code === 'empty_turn'));
+    assert.equal(p.sends, 1);
+    assert.doesNotMatch(output, /empty turn retry/);
+  });
+});
+
+test('the instant resend is not sent when the composer did not switch to instant', async () => {
+  await fixture(ENV_INSTANT, async f => {
+    f.clock.now = NOW;
+    const p = scripted(f, [{ id: SECOND, poll: at => polled(turn(at, 'x')) }]);
+    // The pill keeps showing Medium and every click misses.
+    const base = p.evaluate;
+    p.evaluate = async (fn, arg) => (String(fn).includes('captionSrc') && arg?.matchers
+      ? { level: 'medium', pillText: 'medium' } : base(fn, arg));
+    const loc = p.locator.bind(p);
+    // No menu ever opens: every query finds nothing.
+    const none = () => { const c = { first: () => c, last: () => c, nth: () => c, filter: () => c, locator: () => c,
+      getByRole: () => c, count: async () => 0, isVisible: async () => false,
+      waitFor: async () => { throw new Error('not found'); }, click: async () => { throw new Error('not found'); } }; return c; };
+    p.locator = sel => { const c = loc(sel); c.last = () => none(); c.nth = () => none(); return c; };
+    p.getByRole = () => none();
+    const state = { used: 0, emptyTurnUsed: 2, emptyTurnDeadlineAt: NOW + 400000 };
+    const { output } = await logs(() => assert.rejects(f.chat.completeText('hello', {
+      thinkingMode: 'standard', requestStartedAt: NOW - 200000, stallRetryState: state }),
+      e => e.code === 'empty_turn' && /instant resend was not sent: the composer stayed on standard/.test(e.message)));
+    assert.equal(p.sends, 0);
+    assert.match(output, /empty turn retry 2\/2 \(instant\): skipped, .*composer stayed on standard/);
+  });
+});
