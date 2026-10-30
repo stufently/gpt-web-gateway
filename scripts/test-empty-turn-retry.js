@@ -11,7 +11,9 @@ const NOW = 1_800_000_000_000;
 const COMPLETE = '200 {"status":"COMPLETE"}';
 const STREAMING = '200 {"status":"IS_STREAMING"}';
 const ENV = { CHAT_BG_POLL_INTERVAL_SEC: '15', CHAT_BG_POLL_THINKING_SEC: '90', CHAT_BG_POLL_SEC: '60',
-  CHAT_STALL_WINDOW_SEC: '30', CHAT_STREAM_RESCUE_SEC: '60', CHAT_BG_POLL_EARLY_SEC: '5' };
+  CHAT_STALL_WINDOW_SEC: '30', CHAT_STREAM_RESCUE_SEC: '60', CHAT_BG_POLL_EARLY_SEC: '5',
+  // The tests below pin the same-mode resend; the instant resend (2.16.9) has its own block.
+  CHAT_EMPTY_TURN_INSTANT_RETRY: '0' };
 const empty = () => ({ assistantCount: 0, lastAssistantText: '', bodyTail: '' });
 
 // The active branch of a turn whose prompt was sent at `promptAt` (ms): reasoning only, or an answer.
@@ -96,7 +98,7 @@ test('an empty turn is resent once in a new chat and the resend answers', async 
       'the abandoned conversation is never polled again');
     assert.equal(finished, 1, 'the abandoned attempt releases its pacing slot');
     assert.match(output, /\[chatgpt\] empty turn retry 1\/1: resending in a new chat, \d+s of the request budget left/);
-    assert.match(output, /\[chatgpt\] empty turn retry answered \(12 chars/);
+    assert.match(output, /\[chatgpt\] empty turn retry 1\/1: answered \(12 chars/);
     assert.doesNotMatch(output, /empty turn retry failed/);
   });
 });
@@ -109,7 +111,7 @@ test('a resend that is empty too ends as empty_turn, with no third send', async 
       f.chat.completeText('hello', { thinkingMode: 'instant', requestStartedAt: NOW }),
       e => e.code === 'empty_turn'));
     assert.equal(p.sends, 2);
-    assert.match(output, /empty turn retry failed \(empty_turn\)/);
+    assert.match(output, /empty turn retry 1\/1: failed \(empty_turn\)/);
   });
 });
 
@@ -122,7 +124,7 @@ test('no resend when the request budget left is below the minimum', async () => 
       f.chat.completeText('hello', { thinkingMode: 'instant', requestStartedAt: NOW - 400000 }),
       e => e.code === 'empty_turn'));
     assert.equal(p.sends, 1);
-    assert.match(output, /empty turn retry skipped: \d+s of the request budget left, need 180s/);
+    assert.match(output, /empty turn retry 1\/1: skipped, \d+s of the request budget left, need 180s/);
     assert.doesNotMatch(output, /resending in a new chat/);
   });
 });
@@ -138,7 +140,7 @@ test('the resend waits no longer than the request deadline', async () => {
     assert.equal(p.sends, 2);
     assert.ok(f.clock.now - NOW <= 302000, `ended ${f.clock.now - NOW}ms after the request arrived, budget 300s`);
     assert.ok(f.clock.now - NOW >= 299000, `used the budget (${f.clock.now - NOW}ms)`);
-    assert.match(output, /empty turn retry failed \(timeout\)/);
+    assert.match(output, /empty turn retry 1\/1: failed \(timeout\)/);
   });
 });
 
@@ -304,7 +306,7 @@ test('a resend without a conversation poll still ends at the request deadline', 
       f.chat.completeText('hello', { thinkingMode: 'instant', requestStartedAt: NOW }), e => e.code === 'timeout'));
     assert.equal(p.sends, 2);
     assert.ok(f.clock.now - NOW <= 302000 && f.clock.now - NOW >= 299000, `ended ${f.clock.now - NOW}ms after the request arrived`);
-    assert.match(output, /empty turn retry failed \(timeout\)/);
+    assert.match(output, /empty turn retry 1\/1: failed \(timeout\)/);
     assert.doesNotMatch(output, /still generating — extending/, 'no extension is offered at the request deadline');
   });
 });
@@ -393,7 +395,8 @@ test('a resend is not sent when preparing it ate the budget', async () => {
     const { output } = await logs(() => assert.rejects(f.chat.completeText('hello', { thinkingMode: 'instant', stallRetryState: state }),
       e => e.code === 'empty_turn' && /resend was not sent: only \d+s of the request budget left/.test(e.message)));
     assert.equal(p.sends, 0);
-    assert.match(output, /empty turn retry failed \(empty_turn\)/);
+    assert.match(output, /empty turn retry 1\/1: skipped, .*the resend was not sent/);
+    assert.doesNotMatch(output, /empty turn retry 1\/1: failed/);
   });
 });
 
@@ -424,4 +427,144 @@ test('the request start time reaches completeText from both text routes', async 
   const calls = src.split('completeText(prompt, {').slice(1).map(s => s.slice(0, s.indexOf('}))')));
   assert.equal(calls.length, 2);
   for (const call of calls) assert.match(call, /requestStartedAt: startedAt/);
+});
+
+// Instant resend (2.16.9): when the same-mode resend is empty too, one more resend goes out in
+// instant mode, under the same rules and the same request budget. Default config.
+const ENV_INSTANT = { ...ENV, CHAT_EMPTY_TURN_INSTANT_RETRY: undefined };
+// The composer pill shows levels[k] before send k; the adapter only clicks when it differs from
+// its target, which the fixture page cannot do, so a wrong target fails the turn.
+function withPill(p, levels) {
+  const base = p.evaluate;
+  p.evaluate = async (fn, arg) => {
+    if (String(fn).includes('captionSrc') && arg?.matchers) {
+      const level = levels[Math.min(p.sends, levels.length - 1)];
+      return { level, pillText: level };
+    }
+    return base(fn, arg);
+  };
+  return p;
+}
+const MEDIUM_THEN_INSTANT = ['medium', 'medium', 'instant'];
+const targets = output => [...output.matchAll(/Intelligence pill before: .*\(target=(\w+)\)/g)].map(m => m[1]);
+
+test('a second empty turn is resent once more, in instant mode, and that resend answers', async () => {
+  await fixture(ENV_INSTANT, async f => {
+    f.clock.now = NOW;
+    const THIRD = '33333333-4444-4555-8666-777777777777';
+    const p = withPill(scripted(f, [{ id: CONVERSATION, ...frozen }, { id: SECOND, ...frozen },
+      { id: THIRD, poll: (at, id) => polled(id === THIRD ? turn(at, 'fast answer') : turn(at)) }]), MEDIUM_THEN_INSTANT);
+    const state = { used: 0 };
+    let finished = 0;
+    const { result, output } = await logs(() => f.chat.completeText('hello', {
+      thinkingMode: 'standard', requestStartedAt: NOW, stallRetryState: state, onAttemptFinished: () => { finished++; } }));
+    assert.equal(result.text, 'fast answer');
+    assert.equal(result.conversation_id, THIRD);
+    assert.equal(p.sends, 3, 'the original send, one same-mode resend, one instant resend');
+    assert.equal(state.emptyTurnUsed, 2);
+    assert.equal(finished, 2, 'each abandoned attempt releases its pacing slot');
+    assert.deepEqual(targets(output), ['medium', 'medium', 'instant'], 'only the last resend switches to instant');
+    assert.equal(result.applied.thinking_mode, 'instant');
+    assert.equal(result.applied.thinking, false);
+    assert.equal(result.applied.requested_verified, false);
+    assert.deepEqual(result.applied.thinking_fallback, { from: 'standard', to: 'instant', reason: 'empty_turn', verified: true });
+    assert.match(output, /\[chatgpt\] empty turn retry 1\/2: resending in a new chat, \d+s of the request budget left/);
+    assert.match(output, /\[chatgpt\] empty turn retry 1\/2: failed \(empty_turn\)/);
+    assert.match(output, /\[chatgpt\] empty turn retry 2\/2 \(instant\): resending in a new chat, \d+s of the request budget left/);
+    assert.match(output, /\[chatgpt\] empty turn retry 2\/2 \(instant\): answered \(11 chars/);
+    assert.deepEqual([...new Set(p.polls.filter(x => x.at >= p.sentAt[2]).map(x => x.id))], [THIRD],
+      'neither abandoned conversation is polled again');
+  });
+});
+
+test('an instant resend that is empty too ends as empty_turn, with no fourth send', async () => {
+  await fixture(ENV_INSTANT, async f => {
+    f.clock.now = NOW;
+    const p = withPill(scripted(f, [{ id: CONVERSATION, ...frozen }, { id: SECOND, ...frozen }, { id: SECOND, ...frozen },
+      { id: SECOND, poll: at => polled(turn(at, 'never')) }]), MEDIUM_THEN_INSTANT);
+    const { output } = await logs(() => assert.rejects(
+      f.chat.completeText('hello', { thinkingMode: 'standard', requestStartedAt: NOW }), e => e.code === 'empty_turn'));
+    assert.equal(p.sends, 3);
+    assert.match(output, /empty turn retry 2\/2 \(instant\): failed \(empty_turn\)/);
+  });
+});
+
+test('the instant resend is skipped when the request budget left is below the minimum', async () => {
+  await fixture({ ...ENV_INSTANT, CHAT_REQUEST_BUDGET_SEC: '600', CHAT_EMPTY_TURN_RETRY_MIN_SEC: '180' }, async f => {
+    f.clock.now = NOW;
+    const p = withPill(scripted(f, [{ id: CONVERSATION, ...frozen }, { id: SECOND, ...frozen },
+      { id: SECOND, poll: at => polled(turn(at, 'never')) }]), MEDIUM_THEN_INSTANT);
+    // ~36 s per empty attempt: 600 - 380 - 36 ≥ 180 for the first resend, < 180 for the second.
+    const { output } = await logs(() => assert.rejects(
+      f.chat.completeText('hello', { thinkingMode: 'standard', requestStartedAt: NOW - 380000 }), e => e.code === 'empty_turn'));
+    assert.equal(p.sends, 2);
+    assert.match(output, /empty turn retry 1\/2: resending/);
+    assert.match(output, /empty turn retry 2\/2 \(instant\): skipped, \d+s of the request budget left, need 180s/);
+    assert.doesNotMatch(output, /2\/2 \(instant\): resending/);
+  });
+});
+
+test('the instant resend waits no longer than the request deadline', async () => {
+  await fixture({ ...ENV_INSTANT, CHAT_REQUEST_BUDGET_SEC: '300', CHAT_EMPTY_TURN_RETRY_MIN_SEC: '60' }, async f => {
+    f.clock.now = NOW;
+    const p = withPill(scripted(f, [{ id: CONVERSATION, ...frozen }, { id: SECOND, ...frozen },
+      { id: SECOND, poll: at => polled(turn(at), STREAMING) }]), MEDIUM_THEN_INSTANT);
+    const { output } = await logs(() => assert.rejects(
+      f.chat.completeText('hello', { thinkingMode: 'standard', requestStartedAt: NOW }), e => e.code === 'timeout'));
+    assert.equal(p.sends, 3);
+    assert.ok(f.clock.now - NOW <= 302000, `ended ${f.clock.now - NOW}ms after the request arrived, budget 300s`);
+    assert.match(output, /empty turn retry 2\/2 \(instant\): failed \(timeout\)/);
+  });
+});
+
+test('a continuation gets neither resend with the instant resend on', async () => {
+  await fixture(ENV_INSTANT, async f => {
+    f.clock.now = NOW;
+    const p = withPill(scripted(f, [{ id: CONVERSATION, ...frozen }, { id: CONVERSATION, poll: at => polled(turn(at, 'x')) }]), ['medium']);
+    const { output } = await logs(() => assert.rejects(f.chat.completeText('hello', {
+      thinkingMode: 'standard', conversationId: CONVERSATION, requestStartedAt: NOW }), e => e.code === 'empty_turn'));
+    assert.equal(p.sends, 1);
+    assert.doesNotMatch(output, /empty turn retry/);
+  });
+});
+
+test('an instant resend resumed after a pool restart stays instant and is the last one', async () => {
+  await fixture(ENV_INSTANT, async f => {
+    f.clock.now = NOW;
+    const p = withPill(scripted(f, [{ id: SECOND, ...frozen }, { id: SECOND, poll: at => polled(turn(at, 'never')) }]), ['instant']);
+    const state = { used: 0, emptyTurnUsed: 2, emptyTurnDeadlineAt: NOW + 400000 };
+    const { output } = await logs(() => assert.rejects(f.chat.completeText('hello', {
+      thinkingMode: 'standard', requestStartedAt: NOW - 200000, stallRetryState: state }), e => e.code === 'empty_turn'));
+    assert.equal(p.sends, 1);
+    assert.deepEqual(targets(output), ['instant']);
+    assert.match(output, /empty turn retry 2\/2 \(instant\): failed \(empty_turn\)/);
+  });
+});
+
+test('a caller who asked for instant gets no fallback marker from the instant resend', async () => {
+  await fixture(ENV_INSTANT, async f => {
+    f.clock.now = NOW;
+    const p = scripted(f, [{ id: CONVERSATION, ...frozen }, { id: SECOND, ...frozen },
+      { id: SECOND, poll: at => polled(turn(at, 'fast')) }]);
+    const { result } = await logs(() => f.chat.completeText('hello', { thinkingMode: 'instant', requestStartedAt: NOW }));
+    assert.equal(p.sends, 3);
+    assert.equal(result.applied.thinking_fallback, null);
+    assert.equal(result.applied.requested_verified, true);
+  });
+});
+
+test('a resend that was not sent for lack of budget does not start the instant resend', async () => {
+  // A minimum below the 60 s send floor: without the guard the unsent resend would chain into
+  // the instant one with the same thin budget.
+  await fixture({ ...ENV_INSTANT, CHAT_EMPTY_TURN_RETRY_MIN_SEC: '30' }, async f => {
+    f.clock.now = NOW;
+    const p = withPill(scripted(f, [{ id: SECOND, poll: at => polled(turn(at, 'x')) }]), ['medium']);
+    const state = { used: 0, emptyTurnUsed: 1, emptyTurnDeadlineAt: NOW + 50000 };
+    const { output } = await logs(() => assert.rejects(f.chat.completeText('hello', {
+      thinkingMode: 'standard', requestStartedAt: NOW - 550000, stallRetryState: state }), e => e.code === 'empty_turn'));
+    assert.equal(p.sends, 0);
+    assert.equal(state.emptyTurnUsed, 1);
+    assert.match(output, /empty turn retry 1\/2: skipped, .*the resend was not sent/);
+    assert.doesNotMatch(output, /2\/2 \(instant\)/);
+  });
 });

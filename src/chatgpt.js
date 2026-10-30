@@ -150,6 +150,14 @@ const BG_POLL_EARLY_GRACE_MS = safePositiveInt(process.env.CHAT_BG_POLL_EARLY_SE
 const CHAT_REQUEST_BUDGET_MS = safePositiveInt(process.env.CHAT_REQUEST_BUDGET_SEC, 600) * 1000;
 const EMPTY_TURN_RETRIES = safeNonNegativeInt(process.env.CHAT_EMPTY_TURN_RETRIES, 1);
 const EMPTY_TURN_RETRY_MIN_MS = safePositiveInt(process.env.CHAT_EMPTY_TURN_RETRY_MIN_SEC, 180) * 1000;
+// One more resend after the same-mode ones (2.16.9), in instant mode: an empty turn is a turn
+// with reasoning only, and instant has no reasoning phase. Same rules and budget as the others;
+// the client sees it as applied.thinking_mode "instant" + thinking_fallback reason "empty_turn".
+const EMPTY_TURN_INSTANT_RETRY = safeNonNegativeInt(process.env.CHAT_EMPTY_TURN_INSTANT_RETRY, 1) > 0 ? 1 : 0;
+const EMPTY_TURN_RETRIES_TOTAL = EMPTY_TURN_RETRIES + EMPTY_TURN_INSTANT_RETRY;
+function emptyTurnRetryLabel(n) {
+  return `${n}/${EMPTY_TURN_RETRIES_TOTAL}${n > EMPTY_TURN_RETRIES ? ' (instant)' : ''}`;
+}
 // What must still be left when the resend is about to be sent (after page prep and pacing).
 const EMPTY_TURN_SEND_MIN_MS = 60000;
 function streamStatusComplete(streamStatus) {
@@ -4658,7 +4666,10 @@ async function completeText(prompt, options = {}) {
         || (stallRetryState.emptyTurnUsed || 0) > 0) await ensureNewChat(p);
       else await composerPreflight(p);
 
-      const thinkingMode = normalizeThinkingMode(options.thinkingMode ?? options.thinking);
+      const requestedMode = normalizeThinkingMode(options.thinkingMode ?? options.thinking);
+      // The last empty-turn resend runs in instant mode (no reasoning phase to end up alone).
+      const instantResend = (stallRetryState.emptyTurnUsed || 0) > EMPTY_TURN_RETRIES;
+      const thinkingMode = instantResend ? 'instant' : requestedMode;
       const thinkingState = await setThinkingMode(p, thinkingMode);
 
       const beforeState = await captureTextState(p);
@@ -4685,6 +4696,7 @@ async function completeText(prompt, options = {}) {
       if (retryDeadlineAt !== null && retryDeadlineAt - Date.now() < EMPTY_TURN_SEND_MIN_MS) {
         const late = new Error(`ChatGPT ended the turn without an answer; the resend was not sent: only ${Math.max(0, Math.round((retryDeadlineAt - Date.now()) / 1000))}s of the request budget left after preparing it`);
         late.code = 'empty_turn';
+        late.resendNotSent = true;
         throw late;
       }
       try {
@@ -4704,7 +4716,7 @@ async function completeText(prompt, options = {}) {
         deadlineAt: retryDeadlineAt,
       });
       if (retryDeadlineAt !== null) {
-        console.log(`[chatgpt] empty turn retry answered (${result.text.length} chars, ${Math.round((Date.now() - requestStartedAt) / 1000)}s after the request arrived)`);
+        console.log(`[chatgpt] empty turn retry ${emptyTurnRetryLabel(stallRetryState.emptyTurnUsed || 0)}: answered (${result.text.length} chars, ${Math.round((Date.now() - requestStartedAt) / 1000)}s after the request arrived)`);
       }
 
       if (thinkingState.verified) markHealthyCompletion(slot);
@@ -4714,6 +4726,9 @@ async function completeText(prompt, options = {}) {
       const conversationId = result.conversationId
         || conversationIdFromUrl(p.url())
         || (options.conversationId ? options.conversationId.toLowerCase() : null);
+      // An instant resend is a downgrade the caller did not ask for: report it the way a tier
+      // fallback is reported. A caller who asked for instant got what it asked for.
+      const instantFallback = instantResend && requestedMode !== 'instant';
       return {
         text: result.text,
         conversation_id: conversationId,
@@ -4721,15 +4736,19 @@ async function completeText(prompt, options = {}) {
           thinking: thinkingState.mode !== 'instant',
           thinking_mode: thinkingState.mode || 'instant',
           thinking_verified: !!thinkingState.verified,
-          requested_verified: !!thinkingState.requestedVerified,
-          thinking_fallback: thinkingState.fallback || null,
+          requested_verified: !instantFallback && !!thinkingState.requestedVerified,
+          thinking_fallback: instantFallback
+            ? { from: requestedMode, to: 'instant', reason: 'empty_turn', verified: !!thinkingState.verified }
+            : (thinkingState.fallback || null),
         },
       };
     } catch (err) {
       if (err && err.retryAfterMaintenance) throw err;
       lastError = err;
       if (retryDeadlineAt !== null) {
-        console.log(`[chatgpt] empty turn retry failed (${err.code || 'error'}): ${String(err.message || '').slice(0, 160)}`);
+        const label = emptyTurnRetryLabel(stallRetryState.emptyTurnUsed || 0);
+        if (err.resendNotSent) console.log(`[chatgpt] empty turn retry ${label}: skipped, ${String(err.message || '').slice(0, 160)}`);
+        else console.log(`[chatgpt] empty turn retry ${label}: failed (${err.code || 'error'}): ${String(err.message || '').slice(0, 160)}`);
       }
       // Empty turn (stream COMPLETE, reasoning only, branch frozen): ChatGPT dropped the turn.
       // Resend once in a NEW chat. Safe against a duplicate answer: the abandoned conversation is
@@ -4737,18 +4756,19 @@ async function completeText(prompt, options = {}) {
       // chunks of the old stream are stale. Not for continuations (a new chat loses their context)
       // and not after streaming started. The resend's wait is capped by the request budget.
       if (err.code === 'empty_turn' && !anyDeltaEmitted && !options.conversationId
-          && (stallRetryState.emptyTurnUsed || 0) < EMPTY_TURN_RETRIES) {
+          && !err.resendNotSent && (stallRetryState.emptyTurnUsed || 0) < EMPTY_TURN_RETRIES_TOTAL) {
         const leftMs = requestDeadline - Date.now();
+        const label = emptyTurnRetryLabel((stallRetryState.emptyTurnUsed || 0) + 1);
         if (leftMs >= EMPTY_TURN_RETRY_MIN_MS) {
           stallRetryState.emptyTurnUsed = (stallRetryState.emptyTurnUsed || 0) + 1;
           retryDeadlineAt = requestDeadline;
           stallRetryState.emptyTurnDeadlineAt = requestDeadline;
           if (typeof options.onAttemptFinished === 'function') options.onAttemptFinished();
-          console.log(`[chatgpt] empty turn retry ${stallRetryState.emptyTurnUsed}/${EMPTY_TURN_RETRIES}: resending in a new chat, ${Math.round(leftMs / 1000)}s of the request budget left`);
+          console.log(`[chatgpt] empty turn retry ${label}: resending in a new chat, ${Math.round(leftMs / 1000)}s of the request budget left`);
           attempt -= 1;
           continue;
         }
-        console.log(`[chatgpt] empty turn retry skipped: ${Math.round(leftMs / 1000)}s of the request budget left, need ${Math.round(EMPTY_TURN_RETRY_MIN_MS / 1000)}s`);
+        console.log(`[chatgpt] empty turn retry ${label}: skipped, ${Math.round(leftMs / 1000)}s of the request budget left, need ${Math.round(EMPTY_TURN_RETRY_MIN_MS / 1000)}s`);
       }
       if (err.stallNoAnswer && !anyDeltaEmitted && !options.conversationId
           && slot.pendingReset !== 'hard' && stallRetryState.used < TEXT_STALL_RETRIES) {

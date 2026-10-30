@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.16.9 — 2026-10-30
+
+In 5 h of 2.16.8 the same-mode resend of an empty turn ran 10 times and saved the answer 3 times.
+
+- Instant resend: when the same-mode resend is empty too, the job resends once more in a new
+  chat in instant mode (`CHAT_EMPTY_TURN_INSTANT_RETRY`, default 1). An empty turn is a turn
+  with reasoning only, and instant has no reasoning phase. Same rules as the first resend: not
+  for `conversation_id` continuations, not after a streamed delta, only with
+  `CHAT_EMPTY_TURN_RETRY_MIN_SEC` of the request budget left, and its wait is capped by it.
+- The client sees it in the metadata: `applied.thinking_mode: "instant"`,
+  `requested_verified: false` and `thinking_fallback: {from, to: "instant", reason:
+  "empty_turn"}` (no fallback marker when instant was what the caller asked for). The body is
+  unchanged.
+- Log lines now carry the resend number: `empty turn retry 1/2: resending|answered|failed|skipped`
+  and `empty turn retry 2/2 (instant): ...`. A resend that was not sent because preparing it
+  ate the budget is logged as `skipped`, not `failed`, and does not start the next one.
+
 ## 2.16.8 — 2026-10-30
 
 An empty turn (ChatGPT ends the turn with reasoning only, see 2.16.7) is now resent once by the
