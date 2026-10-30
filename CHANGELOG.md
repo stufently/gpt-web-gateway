@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.16.8 — 2026-10-30
+
+An empty turn (ChatGPT ends the turn with reasoning only, see 2.16.7) is now resent once by the
+gateway itself, and found about a minute sooner. In 9 h of 2.16.7 it was 14 of 502 requests,
+each a 502 about 150 s after the request arrived.
+
+- Early poll: when this turn's response stream closed without any answer text, the background
+  conversation poll starts `CHAT_BG_POLL_EARLY_SEC` (5) seconds later instead of after
+  `CHAT_STREAM_RESCUE_SEC` (60) of page silence, so an empty turn is recognised about 35 s after
+  the stream closed. The detector itself is unchanged; the reload rescue keeps its own window,
+  and an early poll never gets a shorter budget than the response window it replaces.
+- Empty-turn resend: on `empty_turn` the job resends the same prompt once in a NEW chat
+  (`CHAT_EMPTY_TURN_RETRIES`, default 1; not for `conversation_id` continuations, not after a
+  streamed delta). It runs only if at least `CHAT_EMPTY_TURN_RETRY_MIN_SEC` (180) of the
+  request budget `CHAT_REQUEST_BUDGET_SEC` (600, counted from arrival, queue included) is left,
+  re-checks 60 s are left right before sending, and its whole wait — response window,
+  extension, conversation poll and each poll request — is capped by that deadline. The resend
+  and its deadline survive a pool restart. The client gets the resend's answer; a 502 only if
+  the resend is empty too (or ran out of budget).
+- No duplicate answer from the abandoned turn: its conversation is never polled again, and a
+  conversation GET whose body arrives after its turn ended is no longer remembered for the
+  next turn on that slot.
+- Log lines to count: `[chatgpt] empty turn retry 1/1: resending`, `empty turn retry answered`,
+  `empty turn retry failed (<code>)`, `empty turn retry skipped`.
+
 ## 2.16.7 — 2026-10-30
 
 The 504s on heavy text turns were empty turns, not slow ones. In 15 of 15 production cases
