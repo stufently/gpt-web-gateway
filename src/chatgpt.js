@@ -137,6 +137,19 @@ const BG_POLL_MAX_ERRORS = 3;
 // `empty_turn`. Any change on the branch — a thought growing, a new node, a status flip —
 // restarts the count, so a turn ChatGPT is still writing is never cut.
 const BG_POLL_EMPTY_POLLS = safePositiveInt(process.env.CHAT_BG_POLL_EMPTY_POLLS, 3);
+// Early poll (2.16.8): the response stream of this turn closed with no answer text — start the
+// conversation poll this long after the close instead of waiting a whole CHAT_STREAM_RESCUE_SEC
+// of page silence. In production every empty turn sat ~60 s idle between the stream close and
+// the first poll, so an empty_turn surfaced ~130 s after submit. Read-only: the reload rescue
+// keeps its own window.
+const BG_POLL_EARLY_GRACE_MS = safePositiveInt(process.env.CHAT_BG_POLL_EARLY_SEC, 5) * 1000;
+// Empty-turn retry (2.16.8): an empty_turn is resent once in a new chat when the request
+// budget allows it. The budget counts from the moment the request reached the gateway (queue
+// included) and caps the retry's own wait; a retry is not started with less than the minimum
+// left. 600 s is the client budget the other timeouts are sized against.
+const CHAT_REQUEST_BUDGET_MS = safePositiveInt(process.env.CHAT_REQUEST_BUDGET_SEC, 600) * 1000;
+const EMPTY_TURN_RETRIES = safeNonNegativeInt(process.env.CHAT_EMPTY_TURN_RETRIES, 1);
+const EMPTY_TURN_RETRY_MIN_MS = safePositiveInt(process.env.CHAT_EMPTY_TURN_RETRY_MIN_SEC, 180) * 1000;
 function streamStatusComplete(streamStatus) {
   return typeof streamStatus === 'string' && /"status"\s*:\s*"COMPLETE"/.test(streamStatus);
 }
@@ -402,6 +415,8 @@ function onBackendResponse(slot, p, response) {
         cap.openStreams--;
       }
       if (p === slot.page && body) cap.merge(parseSseBody(body));
+      // After the merge, so a reader that sees the close also sees the stream's last text.
+      if (!streamOpen(cap)) cap.streamEndedAt = Date.now();
     }
   })().catch(() => {});
 }
@@ -1837,7 +1852,10 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
   if (baseBudgetMs < CHAT_COMPLETION_TIMEOUT_MS) {
     console.log(`[chat] slow prompt input (${Math.round(options.inputMs / 1000)}s) — response base window ${Math.round(baseBudgetMs / 1000)}s`);
   }
-  let deadline = start + baseBudgetMs;
+  // Hard ceiling from the caller (the empty-turn retry): no window, extension or poll budget
+  // may outlive what is left of the request budget.
+  const hardDeadline = Number.isFinite(options.deadlineAt) ? options.deadlineAt : Infinity;
+  let deadline = Math.min(start + baseBudgetMs, hardDeadline);
   let extended = false;
   // The app can retain an inactive workspace with its own Stop button in the
   // DOM. Only a visible control can block completion or the read-only rescue.
@@ -2050,9 +2068,14 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
     //     Поток закрылся без ответа — rescue снова разрешён.
     //   - поток закрыт, conversation_id известен → вместо reload опрос conversation изнутри
     //     страницы (bgPoll, 2.16.4); reload — только если опрос отказан/не работает.
-    if (!bestText && !rescueAttempted && !bgPoll
-        && Date.now() - lastProgressAt >= CHAT_STREAM_RESCUE_MS
-        && Date.now() - start >= CHAT_STREAM_RESCUE_MS) {
+    //   - поток хода закрылся без текста ответа (2.16.8) — опрос стартует через
+    //     CHAT_BG_POLL_EARLY_SEC после закрытия, не дожидаясь окна тишины; reload — нет.
+    const silent = Date.now() - lastProgressAt >= CHAT_STREAM_RESCUE_MS
+      && Date.now() - start >= CHAT_STREAM_RESCUE_MS;
+    const early = !silent && !bgPollUnsupported && !!capture && !!capture.streamEndedAt
+      && !streamOpen(capture) && Date.now() - capture.streamEndedAt >= BG_POLL_EARLY_GRACE_MS
+      && !capture.snapshot().lastAssistantText;
+    if (!bestText && !rescueAttempted && !bgPoll && (silent || early)) {
       const generating = await probeStop();
       const stopRecent = lastStopSeenAt > 0 && Date.now() - lastStopSeenAt < RESCUE_STOP_RECENT_MS;
       const streaming = streamOpen(capture);
@@ -2068,11 +2091,19 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
         conversationIdFromUrl(p.url()) || (capture && capture.snapshot().conversationId))) {
         const id = conversationIdFromUrl(p.url()) || capture.snapshot().conversationId;
         const budgetMs = backgroundPollBudgetMs(options.thinkingMode, options.inputMs);
-        bgPoll = { id, until: start + budgetMs, nextAt: Date.now(), errors: 0, polls: 0, lastView: null,
+        // An early poll replaces the stall guard and the deadline sooner than the silent one,
+        // so it never gets less time than the response window it replaces.
+        const until = Math.min(early ? Math.max(start + budgetMs, deadline) : start + budgetMs, hardDeadline);
+        bgPoll = { id, until, nextAt: Date.now(), errors: 0, polls: 0, lastView: null,
           fingerprint: null, samePolls: 0 };
-        console.log(`[bg-poll] no rendered text for ${Math.round((Date.now() - lastProgressAt) / 1000)}s and the response stream is closed — polling the conversation every ${Math.round(BG_POLL_INTERVAL_MS / 1000)}s for up to ${Math.round(budgetMs / 1000)}s after submit instead of reloading`);
+        const why = early
+          ? `the response stream closed ${Math.round((Date.now() - capture.streamEndedAt) / 1000)}s ago without answer text`
+          : `no rendered text for ${Math.round((Date.now() - lastProgressAt) / 1000)}s and the response stream is closed`;
+        console.log(`[bg-poll] ${why} — polling the conversation every ${Math.round(BG_POLL_INTERVAL_MS / 1000)}s for up to ${Math.round((until - start) / 1000)}s after submit instead of reloading`);
         logStallBackend(slotOf(p), capture);
         continue;
+      } else if (early) {
+        // No poll possible yet (no conversation id): the reload rescue keeps its own window.
       } else if (!/\/c\//.test(p.url())) {
         if (!rescueSkipLogged) {
           rescueSkipLogged = true;
@@ -2132,13 +2163,13 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
       // Re-check live progress at the boundary — don't trust a possibly-stale poll
       // (captureTextState may have returned null). If ChatGPT is still streaming/
       // thinking, grant one extra window instead of cutting an in-progress answer.
-      if (!extended) {
+      if (!extended && Date.now() < hardDeadline) {
         // An open response stream is generation too: the Stop probe alone can miss it.
         const stillGenerating = (await probeStop()) || streamOpen(capture);
         const progressedRecently = Date.now() - lastProgressAt < stallWindowMs;
         if (stillGenerating && progressedRecently) {
           extended = true;
-          deadline = Date.now() + CHAT_COMPLETION_RETRY_TIMEOUT_MS;
+          deadline = Math.min(Date.now() + CHAT_COMPLETION_RETRY_TIMEOUT_MS, hardDeadline);
           console.log(`[chat] base ${Math.round(CHAT_COMPLETION_TIMEOUT_MS / 1000)}s elapsed, still generating — extending +${Math.round(CHAT_COMPLETION_RETRY_TIMEOUT_MS / 1000)}s`);
           continue;
         }
@@ -4585,6 +4616,11 @@ async function completeText(prompt, options = {}) {
   const maxAttempts = CHATGPT_TEXT_RETRY_ATTEMPTS;
   // Routes supply the same object on a pool restart, even on another slot.
   const stallRetryState = options.stallRetryState || { used: 0 };
+  // The request budget for the empty-turn retry counts from when the route accepted the request.
+  const requestStartedAt = Number.isFinite(options.requestStartedAt) ? options.requestStartedAt : Date.now();
+  const requestDeadline = requestStartedAt + CHAT_REQUEST_BUDGET_MS;
+  // Set while the empty-turn resend runs: its wait is capped by the request deadline.
+  let retryDeadlineAt = null;
   let lastError;
   let pageLoadFailures = 0;
   // Streaming guard: once onDelta has fired, bytes of THIS attempt's answer are already
@@ -4608,7 +4644,8 @@ async function completeText(prompt, options = {}) {
       const p = await ensureLoggedIn(slot);
 
       if (options.conversationId) await openConversation(p, options.conversationId);
-      else if (!options.reuseChat || attempt > 0 || stallRetryState.used > 0) await ensureNewChat(p);
+      else if (!options.reuseChat || attempt > 0 || stallRetryState.used > 0
+        || (stallRetryState.emptyTurnUsed || 0) > 0) await ensureNewChat(p);
       else await composerPreflight(p);
 
       const thinkingMode = normalizeThinkingMode(options.thinkingMode ?? options.thinking);
@@ -4647,7 +4684,11 @@ async function completeText(prompt, options = {}) {
         onDelta,
         prompt,      // subtracted from the tier-limit scan: it is rendered on the page too
         inputMs: inputSpentMs, // every attempt's input, not just this one's
+        deadlineAt: retryDeadlineAt,
       });
+      if (retryDeadlineAt !== null) {
+        console.log(`[chatgpt] empty turn retry answered (${result.text.length} chars, ${Math.round((Date.now() - requestStartedAt) / 1000)}s after the request arrived)`);
+      }
 
       if (thinkingState.verified) markHealthyCompletion(slot);
       // conversation_id sources, best first: backend-api capture → chat URL after the
@@ -4670,6 +4711,27 @@ async function completeText(prompt, options = {}) {
     } catch (err) {
       if (err && err.retryAfterMaintenance) throw err;
       lastError = err;
+      if (retryDeadlineAt !== null) {
+        console.log(`[chatgpt] empty turn retry failed (${err.code || 'error'}): ${String(err.message || '').slice(0, 160)}`);
+      }
+      // Empty turn (stream COMPLETE, reasoning only, branch frozen): ChatGPT dropped the turn.
+      // Resend once in a NEW chat. Safe against a duplicate answer: the abandoned conversation is
+      // never read again — the new turn has its own capture, conversation id and poll, and late
+      // chunks of the old stream are stale. Not for continuations (a new chat loses their context)
+      // and not after streaming started. The resend's wait is capped by the request budget.
+      if (err.code === 'empty_turn' && !anyDeltaEmitted && !options.conversationId
+          && (stallRetryState.emptyTurnUsed || 0) < EMPTY_TURN_RETRIES) {
+        const leftMs = requestDeadline - Date.now();
+        if (leftMs >= EMPTY_TURN_RETRY_MIN_MS) {
+          stallRetryState.emptyTurnUsed = (stallRetryState.emptyTurnUsed || 0) + 1;
+          retryDeadlineAt = requestDeadline;
+          if (typeof options.onAttemptFinished === 'function') options.onAttemptFinished();
+          console.log(`[chatgpt] empty turn retry ${stallRetryState.emptyTurnUsed}/${EMPTY_TURN_RETRIES}: resending in a new chat, ${Math.round(leftMs / 1000)}s of the request budget left`);
+          attempt -= 1;
+          continue;
+        }
+        console.log(`[chatgpt] empty turn retry skipped: ${Math.round(leftMs / 1000)}s of the request budget left, need ${Math.round(EMPTY_TURN_RETRY_MIN_MS / 1000)}s`);
+      }
       if (err.stallNoAnswer && !anyDeltaEmitted && !options.conversationId
           && slot.pendingReset !== 'hard' && stallRetryState.used < TEXT_STALL_RETRIES) {
         stallRetryState.used += 1;

@@ -981,6 +981,7 @@ async function handleTextCompletion(req, res, prompt) {
       beforeSubmit,
       onAttemptFinished,
       stallRetryState,
+      requestStartedAt: startedAt, // the empty-turn retry budget counts queue time too
     })), conversationKey(conversationId));
 
     const applied = result.applied || { thinking: false, thinking_mode: 'instant' };
@@ -1079,6 +1080,7 @@ async function streamTextCompletion(res, prompt, { thinkingMode, webSearch, conv
       beforeSubmit,
       onAttemptFinished,
       stallRetryState,
+      requestStartedAt: startedAt, // the empty-turn retry budget counts queue time too
       // Called with the latest FULL text; the emitter turns it into append-only deltas.
       onDelta: (fullText) => {
         try {
