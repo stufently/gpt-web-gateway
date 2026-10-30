@@ -34,6 +34,12 @@ const mutations = [
   ['E20', R, "      stallRetryState,\n      requestStartedAt: startedAt, // the empty-turn retry budget counts queue time too\n    })), conversationKey(conversationId));\n\n    const applied", "      stallRetryState,\n    })), conversationKey(conversationId));\n\n    const applied"],
   ['E21', C, 'deadline = Math.min(Date.now() + CHAT_COMPLETION_RETRY_TIMEOUT_MS, hardDeadline);', 'deadline = Date.now() + CHAT_COMPLETION_RETRY_TIMEOUT_MS;'],
   ['E22', C, 'if (!extended && Date.now() < hardDeadline) {', 'if (!extended) {'],
+  ['E23', C, 'if (snap && snap.lastAssistantText && activeCapture(slot) === cap) {', 'if (snap && snap.lastAssistantText) {'],
+  ['E24', C, '          stallRetryState.emptyTurnDeadlineAt = requestDeadline;\n', ''],
+  ['E25', C, 'let retryDeadlineAt = Number.isFinite(stallRetryState.emptyTurnDeadlineAt) ? stallRetryState.emptyTurnDeadlineAt : null;', 'let retryDeadlineAt = null;'],
+  ['E26', C, 'if (retryDeadlineAt !== null && retryDeadlineAt - Date.now() < EMPTY_TURN_SEND_MIN_MS) {', 'if (false) {'],
+  ['E27', C, 'const waitMs = Math.max(1000, Math.min(BG_POLL_FETCH_TIMEOUT_MS * 4, maxWaitMs));', 'const waitMs = BG_POLL_FETCH_TIMEOUT_MS * 4;'],
+  ['E28', C, 'turnNotBeforeSec(capture, start), bgPoll.until - Date.now());', 'turnNotBeforeSec(capture, start));'],
 ];
 
 const sha = b => crypto.createHash('sha256').update(b).digest('hex');

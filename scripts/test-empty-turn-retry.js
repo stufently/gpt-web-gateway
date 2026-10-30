@@ -83,8 +83,11 @@ test('an empty turn is resent once in a new chat and the resend answers', async 
     ]);
     const requestStartedAt = NOW;
     let finished = 0;
+    const state = { used: 0 };
     const { result, output } = await logs(() => f.chat.completeText('hello', {
-      thinkingMode: 'instant', requestStartedAt, onAttemptFinished: () => { finished++; } }));
+      thinkingMode: 'instant', requestStartedAt, stallRetryState: state, onAttemptFinished: () => { finished++; } }));
+    assert.deepEqual(state, { used: 0, emptyTurnUsed: 1, emptyTurnDeadlineAt: NOW + 600000 },
+      'the resend and its deadline are recorded in the per-job state');
     assert.equal(result.text, 'retry answer');
     assert.equal(result.conversation_id, SECOND);
     assert.equal(p.sends, 2, 'exactly one resend');
@@ -334,6 +337,86 @@ test('a silent-window poll of the resend is capped by the request deadline too',
     assert.match(output, /no rendered text for \d+s and the response stream is closed/);
     assert.ok(f.clock.now - NOW <= 302000, `ended ${f.clock.now - NOW}ms after the request arrived`);
   });
+});
+
+test('a conversation GET of the abandoned turn that resolves during the resend is not its answer', async () => {
+  await fixture(ENV, async f => {
+    f.clock.now = NOW;
+    let release;
+    const late = new Promise(resolve => { release = resolve; });
+    let p;
+    p = scripted(f, [
+      // Read by the app during the first turn, body delivered only once the resend runs.
+      { id: CONVERSATION, ...frozen, onSend: page => page.emit('response', response({ method: 'GET',
+        url: `/backend-api/conversation/${CONVERSATION}`, ct: 'application/json', data: undefined })) },
+      // The body arrives while the resend already waits (its first poll); the resend's own
+      // answer only on the next poll.
+      { id: SECOND, poll: (at, id) => {
+        if (id !== SECOND) return polled(turn(p.sentAt[0], 'LATE'));
+        if (p.polls.filter(x => x.id === SECOND).length === 1) {
+          const data = turn(p.sentAt[0], 'LATE');
+          data.conversation_id = CONVERSATION;
+          release(data);
+          return polled(turn(at), STREAMING);
+        }
+        return polled(turn(at, 'retry answer'));
+      } },
+    ]);
+    const emit = p.emit.bind(p);
+    p.emit = (event, res) => {
+      if (event === 'response' && res.request().method() === 'GET') res.json = () => late;
+      return emit(event, res);
+    };
+    const { result } = await logs(() => f.chat.completeText('hello', { thinkingMode: 'instant', requestStartedAt: NOW }));
+    assert.equal(result.text, 'retry answer');
+    assert.equal(result.conversation_id, SECOND);
+  });
+});
+
+test('a resend resumed after a pool restart keeps the request deadline', async () => {
+  await fixture(ENV, async f => {
+    f.clock.now = NOW;
+    const p = scripted(f, [{ id: SECOND, poll: at => polled(turn(at), STREAMING) }]);
+    const state = { used: 0, emptyTurnUsed: 1, emptyTurnDeadlineAt: NOW + 100000 };
+    await logs(() => assert.rejects(f.chat.completeText('hello', { thinkingMode: 'instant', requestStartedAt: NOW - 500000,
+      stallRetryState: state }), e => e.code === 'timeout'));
+    assert.equal(p.sends, 1);
+    assert.ok(f.clock.now - NOW <= 102000, `ended ${f.clock.now - NOW}ms, deadline 100s`);
+  });
+});
+
+test('a resend is not sent when preparing it ate the budget', async () => {
+  await fixture(ENV, async f => {
+    f.clock.now = NOW;
+    const p = scripted(f, [{ id: SECOND, poll: at => polled(turn(at, 'x')) }]);
+    const state = { used: 0, emptyTurnUsed: 1, emptyTurnDeadlineAt: NOW + 50000 };
+    const { output } = await logs(() => assert.rejects(f.chat.completeText('hello', { thinkingMode: 'instant', stallRetryState: state }),
+      e => e.code === 'empty_turn' && /resend was not sent: only \d+s of the request budget left/.test(e.message)));
+    assert.equal(p.sends, 0);
+    assert.match(output, /empty turn retry failed \(empty_turn\)/);
+  });
+});
+
+test('a hung poll of a resend gives up at the request deadline, not after its own timeout', async () => {
+  await fixture(ENV, async f => {
+    const { p, capture } = await closedTurn(f, { polls: () => new Promise(() => {}) });
+    const t0 = performance.now();
+    await logs(() => assert.rejects(f.chat._test.waitAndExtractText(p, empty(),
+      { capture, thinkingMode: 'instant', deadlineAt: NOW + 7000 }), e => e.code === 'timeout'));
+    const took = performance.now() - t0;
+    assert.ok(took < 10000, `a 2s remainder took ${Math.round(took)}ms of real time`);
+  });
+});
+
+test('a slow conversation poll is cut at the remaining budget', async () => {
+  const chat = require('../src/chatgpt');
+  const hung = { evaluate: () => new Promise(() => {}) };
+  const t0 = performance.now();
+  const r = await chat._test.pollConversation(hung, CONVERSATION, NOW / 1000, 1200);
+  const took = performance.now() - t0;
+  assert.equal(r.kind, 'error');
+  assert.match(r.detail, /poll deadline/);
+  assert.ok(took >= 1100 && took < 5000, `waited ${Math.round(took)}ms for a 1.2s budget`);
 });
 
 test('the request start time reaches completeText from both text routes', async () => {

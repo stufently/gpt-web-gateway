@@ -150,6 +150,8 @@ const BG_POLL_EARLY_GRACE_MS = safePositiveInt(process.env.CHAT_BG_POLL_EARLY_SE
 const CHAT_REQUEST_BUDGET_MS = safePositiveInt(process.env.CHAT_REQUEST_BUDGET_SEC, 600) * 1000;
 const EMPTY_TURN_RETRIES = safeNonNegativeInt(process.env.CHAT_EMPTY_TURN_RETRIES, 1);
 const EMPTY_TURN_RETRY_MIN_MS = safePositiveInt(process.env.CHAT_EMPTY_TURN_RETRY_MIN_SEC, 180) * 1000;
+// What must still be left when the resend is about to be sent (after page prep and pacing).
+const EMPTY_TURN_SEND_MIN_MS = 60000;
 function streamStatusComplete(streamStatus) {
   return typeof streamStatus === 'string' && /"status"\s*:\s*"COMPLETE"/.test(streamStatus);
 }
@@ -372,7 +374,10 @@ function onBackendResponse(slot, p, response) {
       const snap = !data ? null
         : cap ? extractTurnAnswer(data, { notBeforeSec: turnNotBeforeSec(cap) })
           : extractAssistantFromMapping(data);
-      if (snap && snap.lastAssistantText) {
+      // A body that resolves after its turn ended belongs to that turn only: remembering it would
+      // hand an abandoned conversation's late answer to the next turn on this slot (e.g. the
+      // empty-turn resend — Codex review).
+      if (snap && snap.lastAssistantText && activeCapture(slot) === cap) {
         rememberConversation(slot, snap);
       }
       return;
@@ -1790,13 +1795,16 @@ async function conversationPollInPage({ id, paths, timeoutMs }) {
 // One poll → { kind: 'ok', snap, path, streamStatus } | { kind: 'unsupported', detail }
 // (the endpoint refuses or answers an unknown shape: fall back to reload) |
 // { kind: 'error', detail } (transient: retry on the next interval).
-async function pollConversation(p, conversationId, notBeforeSec) {
+async function pollConversation(p, conversationId, notBeforeSec, maxWaitMs = Infinity) {
   let timer;
+  // Never wait for a poll past the caller's remaining budget (the poll budget or the request
+  // deadline of an empty-turn resend), but always give it at least a second.
+  const waitMs = Math.max(1000, Math.min(BG_POLL_FETCH_TIMEOUT_MS * 4, maxWaitMs));
   let res;
   try {
     res = await Promise.race([
       p.evaluate(conversationPollInPage, { id: conversationId, paths: BG_POLL_PATHS, timeoutMs: BG_POLL_FETCH_TIMEOUT_MS }),
-      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('poll deadline')), BG_POLL_FETCH_TIMEOUT_MS * 4); }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('poll deadline')), waitMs); }),
     ]);
   } catch (e) {
     return { kind: 'error', detail: String((e && e.message) || e).slice(0, 160) };
@@ -2013,7 +2021,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
     if (bgPoll && Date.now() >= bgPoll.nextAt) {
       bgPoll.nextAt = Date.now() + BG_POLL_INTERVAL_MS;
       bgPoll.polls++;
-      const r = await pollConversation(p, bgPoll.id, turnNotBeforeSec(capture, start));
+      const r = await pollConversation(p, bgPoll.id, turnNotBeforeSec(capture, start), bgPoll.until - Date.now());
       if (r.kind === 'ok') {
         bgPoll.errors = 0;
         liveness.touch(slotOf(p).jobId);
@@ -4619,8 +4627,10 @@ async function completeText(prompt, options = {}) {
   // The request budget for the empty-turn retry counts from when the route accepted the request.
   const requestStartedAt = Number.isFinite(options.requestStartedAt) ? options.requestStartedAt : Date.now();
   const requestDeadline = requestStartedAt + CHAT_REQUEST_BUDGET_MS;
-  // Set while the empty-turn resend runs: its wait is capped by the request deadline.
-  let retryDeadlineAt = null;
+  // Set while the empty-turn resend runs: its wait is capped by the request deadline. Kept in
+  // the per-job state so a pool restart (retryAfterMaintenance) resumes the resend under the
+  // same deadline instead of a fresh full window (Codex review).
+  let retryDeadlineAt = Number.isFinite(stallRetryState.emptyTurnDeadlineAt) ? stallRetryState.emptyTurnDeadlineAt : null;
   let lastError;
   let pageLoadFailures = 0;
   // Streaming guard: once onDelta has fired, bytes of THIS attempt's answer are already
@@ -4670,6 +4680,13 @@ async function completeText(prompt, options = {}) {
       // never retry into a duplicate send. The post-call assignment is a backstop.
       const timing = {};
       if (typeof options.beforeSubmit === 'function') await options.beforeSubmit();
+      // Preparation and pacing of the resend are not free: re-check the budget at the last moment
+      // before anything is sent, and give the client the original empty_turn if it ran out.
+      if (retryDeadlineAt !== null && retryDeadlineAt - Date.now() < EMPTY_TURN_SEND_MIN_MS) {
+        const late = new Error(`ChatGPT ended the turn without an answer; the resend was not sent: only ${Math.max(0, Math.round((retryDeadlineAt - Date.now()) / 1000))}s of the request budget left after preparing it`);
+        late.code = 'empty_turn';
+        throw late;
+      }
       try {
         await typeAndSubmit(p, prompt, false, () => { submitted = true; }, timing, capture);
       } finally {
@@ -4725,6 +4742,7 @@ async function completeText(prompt, options = {}) {
         if (leftMs >= EMPTY_TURN_RETRY_MIN_MS) {
           stallRetryState.emptyTurnUsed = (stallRetryState.emptyTurnUsed || 0) + 1;
           retryDeadlineAt = requestDeadline;
+          stallRetryState.emptyTurnDeadlineAt = requestDeadline;
           if (typeof options.onAttemptFinished === 'function') options.onAttemptFinished();
           console.log(`[chatgpt] empty turn retry ${stallRetryState.emptyTurnUsed}/${EMPTY_TURN_RETRIES}: resending in a new chat, ${Math.round(leftMs / 1000)}s of the request budget left`);
           attempt -= 1;
