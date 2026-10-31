@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.16.10 — 2026-10-31
+
+A turn that ChatGPT drops in the middle of the answer is no longer returned as the answer. On
+30–31 October heavy thinking-mode prompts came back as HTTP 200 with JSON cut at 29–4865
+characters; a follow-up in the same conversation showed the stored message ended at the same
+place, so the cut is ChatGPT's. The gateway took it because the end of the response stream
+(`[DONE]` / `message_stream_complete`) marked the answer complete.
+
+- The stream reader now tells the end of the stream from the end of the answer: the latter
+  is only the answer message's own `finished_successfully` / `end_turn`. A finished answer is
+  taken from the stream at once, as before.
+- Stream over, answer unfinished: the background conversation poll decides. A finished
+  answer there is returned; a partial answer that stays frozen with the stream status
+  COMPLETE for `CHAT_BG_POLL_EMPTY_POLLS` polls fails as `empty_turn` ("ended the turn
+  mid-answer"), so the existing resend applies. Without a pollable conversation the stream
+  text is returned as before, with a log note.
+- While that check runs, the page text (the same cut) is not taken as the answer either.
+- Logs: `[backend-read] the response stream closed before the answer message finished (N
+  chars)` and `[bg-poll] #K cut turn: ...`.
+
 ## 2.16.9 — 2026-10-30
 
 In 5 h of 2.16.8 the same-mode resend of an empty turn ran 10 times and saved the answer 3 times.
