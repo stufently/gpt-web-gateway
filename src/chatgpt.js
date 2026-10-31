@@ -1931,9 +1931,25 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
         lastProgressAt = Date.now(); // streamed backend deltas are live progress
         emitDelta(snap.lastAssistantText);
       }
-      if (snap.isComplete && snap.lastAssistantText) {
-        console.log(`[backend-read] answer taken from backend-api stream (${snap.lastAssistantText.length} chars)`);
-        return { text: snap.lastAssistantText, conversationId: snap.conversationId || conversationIdFromUrl(p.url()) };
+      // During the mid-answer check a late finish of the same stream (the full body merged
+      // after the close) still wins over the poll.
+      if (snap.isComplete && snap.lastAssistantText && (snap.messageComplete || !(bgPoll && bgPoll.midAnswer))) {
+        // The stream is over, but did the ANSWER finish? ChatGPT also closes the stream of a turn
+        // it abandoned mid-answer; that text is a cut, not the reply (2026-10-31). Without the
+        // message's own finish the conversation decides: finished → its text, frozen → empty_turn.
+        const id = conversationIdFromUrl(p.url()) || snap.conversationId;
+        if (snap.messageComplete || bgPollUnsupported || !isValidConversationId(id)) {
+          const how = snap.messageComplete ? ''
+            : '; the stream closed before the answer message finished and the conversation cannot be polled — taken as is';
+          console.log(`[backend-read] answer taken from backend-api stream (${snap.lastAssistantText.length} chars${how})`);
+          return { text: snap.lastAssistantText, conversationId: snap.conversationId || conversationIdFromUrl(p.url()) };
+        }
+        const budgetMs = backgroundPollBudgetMs(options.thinkingMode, options.inputMs);
+        const until = Math.min(Math.max(start + budgetMs, deadline), hardDeadline);
+        bgPoll = { id, until, nextAt: Date.now(), errors: 0, polls: 0, lastView: null,
+          fingerprint: null, samePolls: 0, midAnswer: true };
+        console.log(`[backend-read] the response stream closed before the answer message finished (${snap.lastAssistantText.length} chars) — polling the conversation every ${Math.round(BG_POLL_INTERVAL_MS / 1000)}s for up to ${Math.round((until - start) / 1000)}s after submit to confirm it`);
+        logStallBackend(slotOf(p), capture);
       }
       // Post-reload path (stream-rescue): the conversation GET carries the finished
       // answer. Only trust a fetch made during THIS turn with genuinely new text.
@@ -2023,7 +2039,10 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
       }
 
       const stopBtn = await probeStop();
-      if (bestText && !stopBtn && stableSince && Date.now() - stableSince >= stableMs) {
+      // A mid-answer stream close is being checked against the conversation: the page shows
+      // the same cut text, so it cannot stand in for the answer.
+      if (bestText && !stopBtn && stableSince && Date.now() - stableSince >= stableMs
+          && !(bgPoll && bgPoll.midAnswer)) {
         return { text: bestText, conversationId: conversationIdFromUrl(p.url()) };
       }
     }
@@ -2048,12 +2067,26 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
           emitDelta(snap.lastAssistantText);
           return { text: snap.lastAssistantText, conversationId: snap.conversationId || bgPoll.id };
         }
-        // Only polls that already look empty (this turn, no text, stream COMPLETE) count; any
-        // other poll restarts the count, so a single COMPLETE never fails on its own.
+        // Only polls that already look dropped (this turn, stream COMPLETE, no finished answer)
+        // count; any other poll restarts the count, so a single COMPLETE never fails on its own.
+        // Dropped either before the answer (no text) or in the middle of it (text, unfinished).
+        // A frozen partial counts only when this turn's own stream also closed mid-answer:
+        // without that second signal a partial answer keeps waiting for the budget.
         const looksEmpty = snap.turnFound && !snap.lastAssistantText && streamStatusComplete(r.streamStatus);
-        if (!looksEmpty || !r.fingerprint) { bgPoll.fingerprint = null; bgPoll.samePolls = 0; }
+        const looksCut = !!bgPoll.midAnswer && snap.turnFound && !!snap.lastAssistantText && !snap.isComplete
+          && streamStatusComplete(r.streamStatus);
+        if (!(looksEmpty || looksCut) || !r.fingerprint) { bgPoll.fingerprint = null; bgPoll.samePolls = 0; }
         else if (r.fingerprint === bgPoll.fingerprint) bgPoll.samePolls++;
         else { bgPoll.fingerprint = r.fingerprint; bgPoll.samePolls = 1; }
+        if (looksCut && bgPoll.samePolls >= BG_POLL_EMPTY_POLLS) {
+          const sec = Math.round((Date.now() - start) / 1000);
+          console.log(`[bg-poll] #${bgPoll.polls} cut turn: stream_status COMPLETE, the answer stopped at ${snap.lastAssistantText.length} chars unfinished and the branch unchanged for ${bgPoll.samePolls} polls — giving up ${sec}s after submit`);
+          await saveDebugSnapshot(p, 'text_cut_turn').catch(() => {});
+          // Same failure class and resend as an empty turn: ChatGPT dropped the turn.
+          const err = new Error(`ChatGPT ended the turn mid-answer: the response stream is complete, the answer stopped unfinished at ${snap.lastAssistantText.length} chars and did not change for ${bgPoll.samePolls} polls (${sec}s after submit)`);
+          err.code = 'empty_turn';
+          throw err;
+        }
         if (looksEmpty && bgPoll.samePolls >= BG_POLL_EMPTY_POLLS) {
           const sec = Math.round((Date.now() - start) / 1000);
           console.log(`[bg-poll] #${bgPoll.polls} empty turn: stream_status COMPLETE, no answer text and the branch unchanged for ${bgPoll.samePolls} polls — giving up ${sec}s after submit`);

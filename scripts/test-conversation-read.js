@@ -342,3 +342,42 @@ test('turnFingerprint moves with any progress on the branch and only with it', (
   assert.equal(turnFingerprint(null), '');
   assert.equal(turnFingerprint({ mapping: null }), '');
 });
+
+// 2026-10-31: ChatGPT closes the stream of a turn it dropped mid-answer. The stream's own
+// end ([DONE] / message_stream_complete) is not the answer's finish.
+test('messageComplete: only the answer message finishing sets it, not the end of the stream', () => {
+  const cut = parseSseBody(sse([deltaAdd(assistantShell()), { v: '{"pick": true,' },
+    { type: 'message_stream_complete', conversation_id: CONV_ID }, '[DONE]']));
+  assert.equal(cut.lastAssistantText, '{"pick": true,');
+  assert.equal(cut.isComplete, true, 'the stream is over');
+  assert.equal(cut.messageComplete, false, 'the answer is not');
+  for (const [name, finish] of [
+    ['status', { p: '/message/status', o: 'replace', v: 'finished_successfully' }],
+    ['end_turn', { p: '/message/end_turn', o: 'replace', v: true }]]) {
+    const snap = parseSseBody(sse([deltaAdd(assistantShell()), { v: 'whole' }, { o: 'patch', v: [finish] }]));
+    assert.equal(snap.messageComplete, true, name);
+    assert.equal(snap.isComplete, true, name);
+  }
+  for (const finish of [{ p: '/message/status', o: 'replace', v: 'finished_successfully' },
+    { p: '/message/end_turn', o: 'replace', v: true }]) {
+    const lone = parseSseBody(sse([deltaAdd(assistantShell()), { v: 'whole' }, finish, '[DONE]']));
+    assert.equal(lone.messageComplete, true, `a lone ${finish.p} patch outside a list`);
+    assert.equal(lone.lastAssistantText, 'whole');
+  }
+  assert.equal(parseSseBody(sse([legacyMessage('legacy', 'finished_successfully')])).messageComplete, true);
+  assert.equal(parseSseBody(sse([legacyMessage('legacy'), '[DONE]'])).messageComplete, false);
+  // A finish on a reasoning message is not the answer's finish.
+  const thoughts = { ...assistantShell(), content: { content_type: 'thoughts', thoughts: [] } };
+  assert.equal(parseSseBody(sse([deltaAdd(thoughts),
+    { o: 'patch', v: [{ p: '/message/status', o: 'replace', v: 'finished_successfully' }] }, '[DONE]'])).messageComplete, false);
+});
+
+test('merge adopts a finish only together with text that covers what is kept', () => {
+  const acc = new SseAccumulator();
+  acc.feed(sse([deltaAdd(assistantShell()), { v: 'longer cut text' }, '[DONE]']));
+  acc.merge({ lastAssistantText: 'short', isComplete: true, messageComplete: true });
+  assert.equal(acc.snapshot().messageComplete, false, 'a shorter finished body says nothing about the cut');
+  acc.merge({ lastAssistantText: 'longer cut text', isComplete: true, messageComplete: true });
+  assert.equal(acc.snapshot().messageComplete, true, 'the same text, finished');
+  assert.equal(acc.snapshot().lastAssistantText, 'longer cut text');
+});

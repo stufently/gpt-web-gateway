@@ -191,7 +191,13 @@ class SseAccumulator {
   constructor() {
     this.conversationId = null;
     this.text = '';
+    // `complete`: the stream says the turn is over ([DONE], message_stream_complete, or the
+    // answer's own finish). `messageComplete`: the ANSWER message itself finished
+    // (status finished_successfully / end_turn). ChatGPT can close the stream of a turn it
+    // abandoned mid-answer (2026-10-31: 29–4865-char cuts, message stored cut) — then only
+    // `complete` is set, and the text is not the whole answer.
     this.complete = false;
+    this.messageComplete = false;
     this._lineBuffer = '';
     this._dataLines = [];
     // Whether the current append target is a final assistant message. Bare append
@@ -225,6 +231,7 @@ class SseAccumulator {
       conversationId: this.conversationId,
       lastAssistantText: this.text.trim(),
       isComplete: this.complete,
+      messageComplete: this.messageComplete,
     };
   }
 
@@ -233,10 +240,15 @@ class SseAccumulator {
   merge(snap) {
     if (!snap || !snap.lastAssistantText) return;
     const better = snap.lastAssistantText.length > this.text.trim().length
-      || (snap.isComplete && !this.complete);
+      || (snap.isComplete && !this.complete)
+      || (snap.messageComplete && !this.messageComplete);
     if (!better) return;
-    if (snap.lastAssistantText.length >= this.text.trim().length) this.text = snap.lastAssistantText;
+    const adopted = snap.lastAssistantText.length >= this.text.trim().length;
+    if (adopted) this.text = snap.lastAssistantText;
     if (snap.isComplete) this.complete = true;
+    // Only a finish that covers the text we keep: a shorter finished body says nothing
+    // about the longer text already accumulated.
+    if (snap.messageComplete && adopted) this.messageComplete = true;
     if (snap.conversationId) this.conversationId = snap.conversationId;
   }
 
@@ -292,6 +304,12 @@ class SseAccumulator {
       for (const entry of v) this._handlePatchEntry(entry);
       return;
     }
+    // A lone patch operation outside a list (`{"p":"/message/status","o":"replace",...}`):
+    // the same handling as inside one, so a finish sent this way is not missed.
+    if (typeof p === 'string' && o === 'replace') {
+      this._handlePatchEntry(obj);
+      return;
+    }
     if (typeof v === 'string' && (o === 'append' || o === undefined)) {
       // Bare string append (p omitted = same target as the previous append).
       if (p === undefined || /^\/message\/content\/parts\/\d+$/.test(p)) {
@@ -309,11 +327,11 @@ class SseAccumulator {
       return;
     }
     if (p === '/message/status' && v === 'finished_successfully') {
-      if (this._tracking) this.complete = true;
+      if (this._tracking) this.complete = this.messageComplete = true;
       return;
     }
     if (p === '/message/end_turn' && v === true) {
-      if (this._tracking) this.complete = true;
+      if (this._tracking) this.complete = this.messageComplete = true;
     }
   }
 
@@ -325,7 +343,7 @@ class SseAccumulator {
       // Replace semantics: legacy events repeat the whole text so far. Never shrink —
       // an empty in_progress shell must not wipe already-accumulated delta text.
       if (text.length >= this.text.length) this.text = text;
-      if (isMessageComplete(message)) this.complete = true;
+      if (isMessageComplete(message)) this.complete = this.messageComplete = true;
     } else {
       // Reasoning/tool/user message became the append target — stop tracking until
       // the next final assistant message starts.

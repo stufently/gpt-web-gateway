@@ -441,3 +441,109 @@ test('empty_turn answers 502 with should_retry and its own error kind and metric
   assert.match(body, /gpt_web_gateway_errors_total\{type="empty_turn"\} [1-9]/, 'counted under its own kind');
   assert.match(body, /gpt_web_gateway_duration_seconds_count\{result="empty_turn"\} [1-9]/);
 });
+
+// ---- 2026-10-31: the stream closed in the middle of the answer ----
+// ChatGPT closes the stream of a turn it dropped mid-answer and stores the message cut. The
+// end of the stream is not the end of the answer: the conversation decides.
+const sseBody = events => events.map(e => `data: ${typeof e === 'string' ? e : JSON.stringify(e)}\n\n`).join('');
+const shell = { id: 'a1', author: { role: 'assistant' }, recipient: 'all',
+  content: { content_type: 'text', parts: [''] }, status: 'in_progress', metadata: {} };
+function streamed(capture, text, { finished = false } = {}) {
+  capture.feed(sseBody([{ o: 'add', v: { message: shell, conversation_id: CONVERSATION } }, { v: text },
+    ...(finished ? [{ o: 'patch', v: [{ p: '/message/status', o: 'replace', v: 'finished_successfully' }] }] : []),
+    { type: 'message_stream_complete', conversation_id: CONVERSATION }, '[DONE]']));
+}
+
+test('a stream that closed mid-answer is checked against the conversation and its full text returned', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const { p, capture } = await setup(chat, page, queue, clock,
+      [okWith(conversation({ answer: '{"pick": true, "body": "all of it"}', complete: true }), COMPLETE)]);
+    streamed(capture, '{"pick": true,');
+    const { result, output } = await logs(() => chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extended' }));
+    assert.equal(result.text, '{"pick": true, "body": "all of it"}');
+    assert.equal(p.pollTimes.length, 1);
+    assert.match(output, /stream closed before the answer message finished \(14 chars\)/);
+    assert.doesNotMatch(output, /answer taken from backend-api stream/);
+  });
+});
+
+test('a mid-answer cut that stays frozen fails as empty_turn, never as the cut text', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const { p, capture } = await setup(chat, page, queue, clock, [okWith(conversation({ answer: '{"pick": true,' }), COMPLETE)]);
+    streamed(capture, '{"pick": true,');
+    const { output } = await logs(() => assert.rejects(
+      chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extra_high' }),
+      e => e.code === 'empty_turn' && /mid-answer/.test(e.message) && /at 14 chars/.test(e.message) && /3 polls/.test(e.message)));
+    assert.equal(p.pollTimes.length, 3);
+    assert.match(output, /\[bg-poll\] #3 cut turn: stream_status COMPLETE/);
+  });
+});
+
+test('a mid-answer cut whose turn still moves keeps waiting, then returns the finish', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const polls = ['{"p', '{"pi', '{"pic', '{"pick'].map(a => okWith(conversation({ answer: a }), COMPLETE));
+    polls.push(okWith(conversation({ answer: '{"pick": false}', complete: true }), COMPLETE));
+    const { p, capture } = await setup(chat, page, queue, clock, polls);
+    streamed(capture, '{"p');
+    const { result } = await logs(() => chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extended' }));
+    assert.equal(result.text, '{"pick": false}');
+    assert.equal(p.pollTimes.length, 5);
+  });
+});
+
+test('the page DOM cannot hand back the cut text while the conversation is being checked', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const { p, capture } = await setup(chat, page, queue, clock, [okWith(conversation({ answer: 'cut' }), COMPLETE)]);
+    const base = p.evaluate;
+    p.evaluate = async (fn, arg) => String(fn).includes('assistantCount: assistantMessages.length')
+      ? { assistantCount: 1, lastAssistantText: 'cut', bodyTail: 'cut' } : base(fn, arg);
+    streamed(capture, 'cut');
+    await logs(() => assert.rejects(chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'instant' }),
+      e => e.code === 'empty_turn'));
+  });
+});
+
+test('a finished answer message is taken from the stream at once, without a poll', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const { p, capture } = await setup(chat, page, queue, clock, [ok(conversation())]);
+    streamed(capture, 'whole answer', { finished: true });
+    const { result, output } = await logs(() => chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extended' }));
+    assert.equal(result.text, 'whole answer');
+    assert.equal(p.pollTimes.length, 0);
+    assert.match(output, /answer taken from backend-api stream \(12 chars\)\n/);
+  });
+});
+
+test('without a pollable conversation the mid-answer stream text is taken as is, and says so', async () => {
+  for (const variant of ['no id', 'refused']) {
+    await fixture(ENV, async ({ chat, page, queue, clock }) => {
+      const refused = { ok: false, token: true, tried: [{ path: 'a', status: 404 }] };
+      const { p, capture } = await setup(chat, page, queue, clock, [refused]);
+      streamed(capture, 'partial');
+      if (variant === 'no id') { p.address = 'https://chatgpt.com/'; capture.conversationId = null; }
+      const { result, output } = await logs(() => chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extended' }));
+      assert.equal(result.text, 'partial', variant);
+      assert.equal(p.pollTimes.length, variant === 'no id' ? 0 : 1, variant);
+      assert.match(output, /cannot be polled — taken as is/, variant);
+    });
+  }
+});
+
+test('a finish that reaches the stream during the mid-answer check is taken over the poll', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    let capture;
+    const frozen = okWith(conversation({ answer: 'cut' }), COMPLETE);
+    const polls = [frozen, () => {
+      capture.merge({ lastAssistantText: 'cut and the rest', isComplete: true, messageComplete: true });
+      return frozen;
+    }, frozen, frozen];
+    const ready = await setup(chat, page, queue, clock, polls);
+    capture = ready.capture;
+    const { p } = ready;
+    streamed(capture, 'cut');
+    const { result, output } = await logs(() => chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extended' }));
+    assert.equal(result.text, 'cut and the rest');
+    assert.equal(p.pollTimes.length, 2, 'stops polling once the stream itself finished');
+    assert.match(output, /answer taken from backend-api stream \(16 chars\)\n/);
+  });
+});

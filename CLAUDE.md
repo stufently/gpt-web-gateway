@@ -89,6 +89,11 @@ git diff --cached | grep -nEi \
   `thinking_fallback.reason: "empty_turn"`. Брошенный разговор больше не читается, поэтому догнавший его
   ответ клиенту не попадает. Тесты и мутации — `scripts/test-empty-turn-retry.js`,
   `scripts/mutate-empty-turn.js`.
+- Конец SSE-потока — не конец ответа (2.16.10): ChatGPT закрывает поток и у хода, брошенного
+  посреди ответа. Из потока ответ берётся только при `finished_successfully`/`end_turn` самого
+  сообщения (`messageComplete`); иначе решает опрос conversation, а замёрзший обрезок со
+  stream_status COMPLETE — это `empty_turn` («mid-answer»). Тесты — `scripts/test-bg-poll.js`,
+  `scripts/test-conversation-read.js`.
 
 ## Релиз
 
