@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.16.11 — 2026-11-01
+
+Security: multer 2.4.0 → 2.5.0, the first release with the fix for CVE-2026-113872
+(GHSA-q7qp-rjg7-q26m), flagged HIGH by Trivy in the 01.11 audit. Multipart image uploads are
+the only multer user; 2.5.0 also accepts a field of exactly `limits.fieldSize` bytes. No code
+changes.
+
 ## 2.16.10 — 2026-10-31
 
 A turn that ChatGPT drops in the middle of the answer is no longer returned as the answer. On
