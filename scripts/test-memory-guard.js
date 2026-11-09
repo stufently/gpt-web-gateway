@@ -58,6 +58,23 @@ add('cgroup v1: total_inactive_file is subtracted, the 2^63 sentinel is no limit
   assert.deepStrictEqual(readCgroupMemory({ fsImpl: limited, root: '/cg' }), { usage: 3000, limit: 4096 });
 });
 
+add('cgroup v2 with a host namespace: the own cgroup from /proc/self/cgroup wins over the root', () => {
+  const fsImpl = fakeFs({
+    '/proc/self/cgroup': '0::/system.slice/docker-abc.scope\n',
+    '/cg/memory.current': '99999999999\n',
+    '/cg/memory.max': 'max\n',
+    '/cg/system.slice/docker-abc.scope/memory.current': '700\n',
+    '/cg/system.slice/docker-abc.scope/memory.stat': 'inactive_file 100\n',
+    '/cg/system.slice/docker-abc.scope/memory.max': '1000\n',
+  });
+  assert.deepStrictEqual(readCgroupMemory({ fsImpl, root: '/cg' }), { usage: 600, limit: 1000 });
+  // Private namespace ("0::/") or a path that is not mounted: the root is the container.
+  const priv = fakeFs({ '/proc/self/cgroup': '0::/\n', '/cg/memory.current': '5\n', '/cg/memory.max': '10\n' });
+  assert.deepStrictEqual(readCgroupMemory({ fsImpl: priv, root: '/cg' }), { usage: 5, limit: 10 });
+  const unmounted = fakeFs({ '/proc/self/cgroup': '0::/elsewhere\n', '/cg/memory.current': '5\n', '/cg/memory.max': '10\n' });
+  assert.deepStrictEqual(readCgroupMemory({ fsImpl: unmounted, root: '/cg' }), { usage: 5, limit: 10 });
+});
+
 add('no cgroup memory controller → null', () => {
   assert.strictEqual(readCgroupMemory({ fsImpl: fakeFs({}), root: '/cg' }), null);
 });
@@ -96,7 +113,7 @@ function makeGuard(over = {}) {
     hardPct: 80,
     hardCooldownMs: 120000,
     onSoft: (info) => calls.soft.push(info),
-    onHard: (info) => calls.hard.push(info),
+    onHard: (info, opts) => calls.hard.push({ ...info, delayMs: opts.delayMs }),
     now: () => state.t,
     log: quiet,
     ...over,
@@ -142,8 +159,8 @@ add('exactly at the soft and hard percentages counts as crossing', () => {
 add('hard: one restart while it is in flight; cooldown counts from its end', async () => {
   let finish;
   const { guard, state, calls } = makeGuard({
-    onHard: (info) => {
-      calls.hard.push(info);
+    onHard: (info, opts) => {
+      calls.hard.push({ ...info, delayMs: opts.delayMs });
       return new Promise((resolve) => { finish = resolve; });
     },
   });
@@ -155,15 +172,23 @@ add('hard: one restart while it is in flight; cooldown counts from its end', asy
   guard.check('timer');
   guard.check('before-job');
   assert.strictEqual(calls.hard.length, 1);
+  assert.strictEqual(calls.hard[0].delayMs, 0);
   finish();
   await flush();
-  // Still above hard right after the restart: wait out the cooldown, do not loop.
+  // Still above hard right after the restart: new jobs must stop at once (the restart is
+  // requested now), but the restart itself waits out the rest of the cooldown.
   state.t = 600000 + 119000;
   guard.check('timer');
-  assert.strictEqual(calls.hard.length, 1);
-  state.t = 600000 + 120000;
-  guard.check('timer');
   assert.strictEqual(calls.hard.length, 2);
+  assert.strictEqual(calls.hard[1].delayMs, 1000);
+  guard.check('timer');
+  assert.strictEqual(calls.hard.length, 2, 'in flight: no third request');
+  finish();
+  await flush();
+  state.t = 719000 + 120000;
+  guard.check('timer');
+  assert.strictEqual(calls.hard.length, 3);
+  assert.strictEqual(calls.hard[2].delayMs, 0);
 });
 
 add('hard: a failed restart also ends the in-flight state', async () => {
@@ -250,9 +275,33 @@ add('markAllSlotsForRecycle marks slots with a page and never downgrades a pendi
   b.page = null; b.pendingReset = null;
 });
 
+add('markAllSlotsForRecycle defers a busy slot to the end of its job', () => {
+  const chatgpt = require('../src/chatgpt');
+  const busy = chatgpt.getSlot(14);
+  const idle = chatgpt.getSlot(15);
+  busy.page = {};
+  idle.page = {};
+  const real = console.log;
+  console.log = quiet;
+  try {
+    chatgpt.markAllSlotsForRecycle('memory 72%', [14]);
+    // Mid-job (next image of a batch, next attempt of a turn) the tab must survive.
+    assert.strictEqual(busy.pendingReset, null);
+    assert.strictEqual(busy.recycleAfterJob, true);
+    assert.strictEqual(idle.pendingReset, 'recycle');
+    chatgpt.recordSlotJobFinished(14);
+    assert.strictEqual(busy.pendingReset, 'recycle');
+    assert.strictEqual(busy.recycleAfterJob, false);
+  } finally {
+    console.log = real;
+    busy.page = null; busy.pendingReset = null; busy.completedJobs = 0;
+    idle.page = null; idle.pendingReset = null;
+  }
+});
+
 // ---- route wiring: the pool holds new jobs, never the running one ---------------------
 
-function loadRouterWithStubs(memState, events) {
+function loadRouterWithStubs(memState, events, { noActions = false } = {}) {
   const chatgptPath = require.resolve('../src/chatgpt');
   const guardPath = require.resolve('../src/memory-guard');
   const imagesPath = require.resolve('../src/routes/images');
@@ -279,7 +328,7 @@ function loadRouterWithStubs(memState, events) {
     probeCapabilities: async () => ({}),
     recordSlotJobFinished() {},
     markAllSlotsForRecycle(reason) { events.push(`soft ${reason}`); return 1; },
-    hardResetBrowser: async () => {
+    recycleBrowser: async () => {
       events.push('restart begin');
       await new Promise((resolve) => { bridge.finishRestart = resolve; });
       events.push('restart end');
@@ -287,6 +336,10 @@ function loadRouterWithStubs(memState, events) {
     resetPage() {},
     resetAllSlotPages() {},
   };
+  if (noActions) {
+    delete stub.markAllSlotsForRecycle;
+    delete stub.recycleBrowser;
+  }
   const realGuard = require('../src/memory-guard');
   const fakeGuardModule = {
     ...realGuard,
@@ -430,6 +483,33 @@ add('route: soft level marks pages for recycle and keeps admitting jobs', async 
     assert.strictEqual((await first).status, 200);
     assert.strictEqual(events.filter((e) => e.startsWith('soft ')).length, 1);
     assert.ok(!events.includes('restart begin'));
+  } finally {
+    console.log = realLog;
+    server.closeAllConnections();
+    await new Promise((r) => server.close(r));
+    env.restore();
+  }
+});
+
+add('route: without the browser actions (a chatgpt stub) the guard stays off', async () => {
+  const mem = { usage: 7.9 * GIB };
+  const events = [];
+  const env = loadRouterWithStubs(mem, events, { noActions: true });
+  const realLog = console.log;
+  console.log = quiet;
+  const app = express();
+  app.use(express.json());
+  app.use(env.router);
+  const server = http.createServer(app);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const first = post(port, 'A');
+    await waitFor(() => events.includes('start A'), 'A runs with no restart queued');
+    assert.deepStrictEqual(env.bridge.poolHooks.status().maintenance, { active: null, pending: [] });
+    env.bridge.gates.shift().resolve();
+    assert.strictEqual((await first).status, 200);
+    assert.deepStrictEqual(env.bridge.poolHooks.status().maintenance, { active: null, pending: [] });
   } finally {
     console.log = realLog;
     server.closeAllConnections();

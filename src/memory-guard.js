@@ -45,12 +45,24 @@ function statField(text, field) {
 // container_memory_working_set_bytes and the one that runs into memory.max.
 // limit is null when the cgroup is unlimited ("max", or the v1 near-2^63 sentinel).
 // Returns null when no cgroup memory controller is readable (dev host, macOS).
+// With a private cgroup namespace (Kubernetes, Docker default on v2) the container's own
+// cgroup is the mount root. With --cgroupns=host it is the path from /proc/self/cgroup
+// ("0::/docker/<id>"), so that path is tried first and the root is the fallback.
+function ownCgroupV2Dir(fsImpl, root) {
+  const self = readFileTrim(fsImpl, '/proc/self/cgroup');
+  const m = self && self.match(/^0::(\/\S*)$/m);
+  if (!m || m[1] === '/') return root;
+  const dir = `${root}${m[1]}`;
+  return readFileTrim(fsImpl, `${dir}/memory.current`) !== null ? dir : root;
+}
+
 function readCgroupMemory({ fsImpl = fs, root = '/sys/fs/cgroup' } = {}) {
-  const v2Current = readFileTrim(fsImpl, `${root}/memory.current`);
+  const dir = ownCgroupV2Dir(fsImpl, root);
+  const v2Current = readFileTrim(fsImpl, `${dir}/memory.current`);
   if (v2Current !== null && /^\d+$/.test(v2Current)) {
     const current = Number(v2Current);
-    const inactive = statField(readFileTrim(fsImpl, `${root}/memory.stat`), 'inactive_file') || 0;
-    const maxRaw = readFileTrim(fsImpl, `${root}/memory.max`);
+    const inactive = statField(readFileTrim(fsImpl, `${dir}/memory.stat`), 'inactive_file') || 0;
+    const maxRaw = readFileTrim(fsImpl, `${dir}/memory.max`);
     const limit = maxRaw && /^\d+$/.test(maxRaw) ? Number(maxRaw) : null;
     return { usage: Math.max(0, current - inactive), limit };
   }
@@ -72,7 +84,7 @@ function mib(bytes) {
 }
 
 // readUsage() → { usage, limit } | null. limitOverride (bytes) replaces the cgroup limit.
-// onSoft(info) / onHard(info) run the actions; neither may throw into the caller.
+// onSoft(info) / onHard(info, { delayMs }) run the actions; neither may throw into the caller.
 // onHard may return a promise (the restart): until it settles no second restart is
 // requested, and the cooldown counts from its end, not from the request — draining the
 // running jobs can take minutes, and a restart queued behind a restart is pure downtime.
@@ -108,8 +120,8 @@ function createMemoryGuard({
     }
   }
 
-  function startHard(info) {
-    const result = runAction(onHard, info, 'hard');
+  function startHard(info, delayMs = 0) {
+    const result = runAction(() => onHard(info, { delayMs }), info, 'hard');
     if (!result || typeof result.then !== 'function') {
       lastHardAt = now();
       return;
@@ -155,10 +167,13 @@ function createMemoryGuard({
       } else if (sinceHard >= hardCooldownMs) {
         log(`[memory] ${text} ≥ hard ${hard}% — browser restart requested; new jobs wait until it is done, running jobs finish`);
         startHard(info);
-      } else if (level !== 'hard') {
-        // Above hard right after a restart: the memory is not the browser's, or it grew
-        // back at once. Restarting again in a loop would only stop the service.
-        log(`[memory] ${text} ≥ hard ${hard}% again ${Math.round(sinceHard / 1000)}s after a restart — next restart not before ${Math.round(hardCooldownMs / 1000)}s`);
+      } else {
+        // Above hard again right after a restart. New jobs must still stop (the restart is
+        // queued at once), but the restart waits out the cooldown: memory a restart cannot
+        // free must not become back-to-back restarts.
+        const delayMs = hardCooldownMs - sinceHard;
+        log(`[memory] ${text} ≥ hard ${hard}% again ${Math.round(sinceHard / 1000)}s after a restart — new jobs wait, restart in ${Math.round(delayMs / 1000)}s`);
+        startHard(info, delayMs);
       }
     } else if (seen === 'soft') {
       if (level === 'ok') {

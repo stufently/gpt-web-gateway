@@ -261,6 +261,7 @@ function createSlot(id) {
     menuFailures: 0,
     backendResponses: [],
     completedJobs: 0,
+    recycleAfterJob: false,
   };
 }
 
@@ -4897,14 +4898,21 @@ function discardSlotPage(slot) {
   victim.capture = null;
   victim.lastConversationFetch = null;
   victim.completedJobs = 0;
+  victim.recycleAfterJob = false;
 }
 
 // Called once when a pool job settles, not when it yields to maintenance or
 // between stall attempts. Batch image requests are also one job.
 function recordSlotJobFinished(slotId) {
   const slot = getSlot(slotId);
+  const memoryRecycle = slot.recycleAfterJob;
+  slot.recycleAfterJob = false;
   if (!slot.page) return;
   slot.completedJobs += 1;
+  if (memoryRecycle && !slot.pendingReset) {
+    slot.pendingReset = 'recycle';
+    console.log(`[recycle] slot ${slot.id}: memory recycle deferred to the end of the job — fresh page on next job`);
+  }
   if (PAGE_RECYCLE_AFTER_JOBS > 0 && slot.completedJobs >= PAGE_RECYCLE_AFTER_JOBS && !slot.pendingReset) {
     slot.pendingReset = 'recycle';
     console.log(`[recycle] slot ${slot.id}: page served ${slot.completedJobs} jobs — fresh page on next job`);
@@ -4912,17 +4920,33 @@ function recordSlotJobFinished(slotId) {
 }
 
 // Memory guard, soft level: every slot that has a page gets a fresh one on its next job.
-// A running job keeps its page (the reset is consumed by maybeRecoverSession at the start
-// of the next job), and a stronger pending reset ('page'/'hard') is never downgraded.
-function markAllSlotsForRecycle(reason) {
+// A stronger pending reset ('page'/'hard') is never downgraded. A slot that is running a
+// job only gets recycleAfterJob: maybeRecoverSession runs before EVERY operation, so a
+// pendingReset set now would close the tab between two images of the same batch (or two
+// attempts of one turn); recordSlotJobFinished turns the flag into the reset at job end.
+function markAllSlotsForRecycle(reason, busySlotIds = []) {
+  const busy = new Set(busySlotIds);
   let marked = 0;
   for (const slot of slotsById.values()) {
     if (!slot.page || slot.pendingReset) continue;
-    slot.pendingReset = 'recycle';
+    if (busy.has(slot.id)) {
+      slot.recycleAfterJob = true;
+      console.log(`[recycle] slot ${slot.id}: ${reason} — fresh page after the running job`);
+    } else {
+      slot.pendingReset = 'recycle';
+      console.log(`[recycle] slot ${slot.id}: ${reason} — fresh page on next job`);
+    }
     marked += 1;
-    console.log(`[recycle] slot ${slot.id}: ${reason} — fresh page on next job`);
   }
   return marked;
+}
+
+// Memory guard, hard level. Runs as pool maintenance (no job holds a slot). The live
+// cookies are saved first: hardResetBrowser() relaunches from session.json, and a cookie
+// refreshed since the last save would otherwise be rolled back.
+async function recycleBrowser() {
+  await raceDeadline(saveSession().catch(() => {}), SESSION_SAVE_DEADLINE_MS);
+  await hardResetBrowser();
 }
 
 function resetPage(slot = getSlot(0)) {
@@ -4966,6 +4990,7 @@ module.exports = {
   getSlot,
   recordSlotJobFinished,
   markAllSlotsForRecycle,
+  recycleBrowser,
   probeCapabilities,
   normalizeThinkingMode,
   READ_VIA_BACKEND_API,
