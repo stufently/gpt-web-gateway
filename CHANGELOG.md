@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+Recycle by memory. On 06.11 and 09.11 the pod was OOMKilled at its 8Gi limit during bursts
+of short parallel classifier jobs on three slots: the working set went 2.8 → 7.1 GiB in four
+minutes, and the job-count recycle (`PAGE_RECYCLE_AFTER_JOBS`) never looks at memory. The
+limit stays where it is; the gateway now watches the number the OOM killer acts on.
+
+- The container working set (cgroup v2 `memory.current` minus `inactive_file`, v1 fallback)
+  is checked when a job is submitted, after every job and every `MEMORY_CHECK_INTERVAL_SEC`.
+- At `MEMORY_RECYCLE_SOFT_PCT` (70) of the limit every slot gets a fresh page on its next job.
+- At `MEMORY_RECYCLE_HARD_PCT` (80) a full browser restart is queued as pool maintenance:
+  from that moment no new job starts, running jobs are not aborted and finish, then the
+  browser is rebuilt and the queue resumes. One restart at a time; after it the next one
+  waits `MEMORY_RECYCLE_COOLDOWN_SEC` (120), so memory a restart cannot free does not loop.
+- No cgroup limit (dev host) and no `MEMORY_LIMIT_MB`: the guard is off and says so once.
+- Logs: `[memory] … ≥ soft/hard …`, `[memory] browser restart: …`, `[recycle] slot N: memory …`.
+- Tests: `scripts/test-memory-guard.js`.
+
 ## 2.16.11 — 2026-11-01
 
 Security: multer 2.4.0 → 2.5.0, the first release with the fix for CVE-2026-113872

@@ -304,6 +304,11 @@ Every endpoint returns a uniform error shape:
 | `CHAT_EMPTY_TURN_INSTANT_RETRY` | One more resend after the same-mode ones, in instant mode (no reasoning phase, so an empty turn is near impossible). Same rules and budget; never with `CHAT_EMPTY_TURN_RETRIES=0`; not sent when the composer did not switch to instant. The answer carries `applied.thinking_mode: "instant"` and `thinking_fallback.reason: "empty_turn"`. `0` disables | `1` |
 | `CHAT_EMPTY_TURN_RETRY_MIN_SEC` | No empty-turn resend with less than this much of `CHAT_REQUEST_BUDGET_SEC` left | `180` |
 | `PAGE_RECYCLE_AFTER_JOBS` | Recreate a slot's page on the next job after this many completed jobs on that page. Does not enter recovery probation. `0` disables | `50` |
+| `MEMORY_RECYCLE_SOFT_PCT` | Container working set (cgroup `memory.current` − `inactive_file`) at or above this % of the memory limit: every slot gets a fresh page on its next job. Running jobs are not touched. `0` disables | `70` |
+| `MEMORY_RECYCLE_HARD_PCT` | At or above this %: a full browser restart is queued as maintenance — no new job starts, running jobs finish, then the browser is rebuilt. Checked at submit, after every job and on a timer. `0` disables | `80` |
+| `MEMORY_RECYCLE_COOLDOWN_SEC` | Minimum gap between the end of one memory restart and the next one, so memory that a restart cannot free does not turn into a restart loop | `120` |
+| `MEMORY_CHECK_INTERVAL_SEC` | Background memory check interval; `0` leaves only the checks at submit and after a job | `10` |
+| `MEMORY_LIMIT_MB` | Limit to count percentages from when the cgroup has none (dev host). Overrides the cgroup limit when set | cgroup `memory.max` |
 | `CHATGPT_TEXT_HARD_RESET` | Allow full browser-context rebuild on repeated `page_load_failed` (auto-off in `cdp` mode) | `true` |
 | `HEALTH_STUCK_SEC` | Liveness: queued work without heartbeat for N s → `/health/live` 503 | `900` |
 | `HEALTH_FAILURE_STREAK` | Liveness: N consecutive infra failures → `/health/live` 503 (`refused`/`rate_limit` reset the streak) | `3` |

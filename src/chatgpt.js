@@ -4911,6 +4911,20 @@ function recordSlotJobFinished(slotId) {
   }
 }
 
+// Memory guard, soft level: every slot that has a page gets a fresh one on its next job.
+// A running job keeps its page (the reset is consumed by maybeRecoverSession at the start
+// of the next job), and a stronger pending reset ('page'/'hard') is never downgraded.
+function markAllSlotsForRecycle(reason) {
+  let marked = 0;
+  for (const slot of slotsById.values()) {
+    if (!slot.page || slot.pendingReset) continue;
+    slot.pendingReset = 'recycle';
+    marked += 1;
+    console.log(`[recycle] slot ${slot.id}: ${reason} — fresh page on next job`);
+  }
+  return marked;
+}
+
 function resetPage(slot = getSlot(0)) {
   discardSlotPage(slot);
 }
@@ -4951,6 +4965,7 @@ module.exports = {
   getPoolHooks,
   getSlot,
   recordSlotJobFinished,
+  markAllSlotsForRecycle,
   probeCapabilities,
   normalizeThinkingMode,
   READ_VIA_BACKEND_API,
