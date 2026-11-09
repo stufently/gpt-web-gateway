@@ -306,7 +306,7 @@ Every endpoint returns a uniform error shape:
 | `PAGE_RECYCLE_AFTER_JOBS` | Recreate a slot's page on the next job after this many completed jobs on that page. Does not enter recovery probation. `0` disables | `50` |
 | `MEMORY_RECYCLE_SOFT_PCT` | Container working set (cgroup `memory.current` − `inactive_file`) at or above this % of the memory limit: every slot gets a fresh page on its next job. Running jobs are not touched. `0` disables | `70` |
 | `MEMORY_RECYCLE_HARD_PCT` | At or above this %: a full browser restart is queued as maintenance — no new job starts, running jobs finish, then the browser is rebuilt. Checked at submit, after every job and on a timer. `0` disables | `80` |
-| `MEMORY_RECYCLE_COOLDOWN_SEC` | Minimum gap between the end of one memory restart and the next one, so memory that a restart cannot free does not turn into a restart loop | `120` |
+| `MEMORY_RECYCLE_COOLDOWN_SEC` | Minimum gap between the end of one memory restart and the next one. Above hard inside this gap new jobs still stop at once; the restart waits for the gap to pass, so memory that a restart cannot free does not turn into a restart loop | `120` |
 | `MEMORY_CHECK_INTERVAL_SEC` | Background memory check interval; `0` leaves only the checks at submit and after a job | `10` |
 | `MEMORY_LIMIT_MB` | Limit to count percentages from when the cgroup has none (dev host). Overrides the cgroup limit when set | cgroup `memory.max` |
 | `CHATGPT_TEXT_HARD_RESET` | Allow full browser-context rebuild on repeated `page_load_failed` (auto-off in `cdp` mode) | `true` |
