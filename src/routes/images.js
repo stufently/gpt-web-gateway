@@ -7,8 +7,9 @@ const multer = require('multer');
 // disagree with the actual interception layer about the flag's default.
 const {
   generateImage, editImage, completeText, probeCapabilities, READ_VIA_BACKEND_API,
-  setPoolHooks, recordSlotJobFinished,
+  setPoolHooks, recordSlotJobFinished, markAllSlotsForRecycle, recycleBrowser,
 } = require('../chatgpt');
+const { createMemoryGuard, readCgroupMemory, configFromEnv: memoryConfigFromEnv } = require('../memory-guard');
 const { parseBool, normalizeThinkingMode, parseThinkingMode, parseWebSearchRequested } = require('../params');
 const { isValidConversationId } = require('../lib/conversation-read');
 const { createStreamEmitter } = require('../lib/sse-transform');
@@ -170,7 +171,7 @@ function startMaintenanceHeartbeat() {
 // this module. Heartbeats start only once the work is actually active: a skipped
 // maintenance request resolves without calling fn, and an exclusive starts its
 // timer when the release function is handed back.
-setPoolHooks({
+const poolHooks = {
   requestMaintenance(name, fn, opts) {
     return pool.requestMaintenance(name, async () => {
       const stop = startMaintenanceHeartbeat();
@@ -194,7 +195,48 @@ setPoolHooks({
     });
   },
   status: () => pool.status(),
+};
+setPoolHooks(poolHooks);
+
+// Recycle by memory (see src/memory-guard.js). Checked when a job is submitted, when a
+// job finishes and on a timer. The hard level enqueues maintenance synchronously, so the
+// pool stops starting jobs at once: a submit right after it queues, and the settle of the
+// finishing job does not hand its slot to the next one. Requests merge by name, so a burst
+// of checks makes one restart. Without the browser actions (route tests stub chatgpt) the
+// guard is off: it could only act on the test runner's own cgroup.
+const memoryConfig = memoryConfigFromEnv();
+const memoryActions = typeof markAllSlotsForRecycle === 'function' && typeof recycleBrowser === 'function';
+if (!memoryActions) {
+  memoryConfig.softPct = 0;
+  memoryConfig.hardPct = 0;
+}
+const memoryGuard = createMemoryGuard({
+  readUsage: () => readCgroupMemory(),
+  softPct: memoryConfig.softPct,
+  hardPct: memoryConfig.hardPct,
+  limitOverride: memoryConfig.limitOverride,
+  hardCooldownMs: memoryConfig.hardCooldownMs,
+  onSoft: (info) => markAllSlotsForRecycle(
+    `memory ${info.pct}%`,
+    pool.status().slots.filter((slot) => slot.busy).map((slot) => slot.slotId),
+  ),
+  // delayMs > 0: above hard again inside the cooldown. The maintenance is queued at once,
+  // so no new job starts, and the restart itself waits out the rest of the cooldown.
+  onHard: (info, { delayMs = 0 } = {}) => Promise.resolve(poolHooks.requestMaintenance('memory-recycle', async () => {
+    if (delayMs > 0) {
+      console.log(`[memory] browser restart in ${Math.round(delayMs / 1000)}s (cooldown); new jobs wait`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    console.log('[memory] browser restart: all slots idle, rebuilding the browser');
+    await recycleBrowser();
+  })).catch((err) => {
+    console.log(`[memory] browser restart failed: ${err && err.message ? err.message : err}`);
+  }),
 });
+if (memoryConfig.checkIntervalMs > 0) {
+  const memoryTimer = setInterval(() => memoryGuard.check('timer'), memoryConfig.checkIntervalMs);
+  if (typeof memoryTimer.unref === 'function') memoryTimer.unref();
+}
 
 // A cooldown armed while this job was already in line must still stop it.
 // checkRateLimit() runs before the job is accepted and nothing re-checked
@@ -222,6 +264,9 @@ function assertNotRateLimited() {
 function submitJob(fn, { key } = {}) {
   let attempts = 0;
   const stallRetryState = { used: 0 };
+  // Before admission: above the hard level the restart is queued first, so this job waits
+  // behind it instead of taking a slot in a browser that is about to be killed.
+  memoryGuard.check('before-job');
   const promise = pool.submit((ctx) => runWithLogContext({ slotId: ctx.slotId }, async () => {
     attempts += 1;
     let requeued = false;
@@ -242,6 +287,8 @@ function submitJob(fn, { key } = {}) {
     } finally {
       if (!requeued) recordSlotJobFinished?.(ctx.slotId);
       if (jobIdBySlot.get(ctx.slotId) === ctx.jobId) jobIdBySlot.delete(ctx.slotId);
+      // Before the pool settles this job and starts the next one in this slot.
+      memoryGuard.check('after-job');
     }
   }), { key });
   progress.jobStarted();
