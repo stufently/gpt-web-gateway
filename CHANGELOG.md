@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.17.0 — 2026-11-10
 
 Recycle by memory. On 06.11 and 09.11 the pod was OOMKilled at its 8Gi limit during bursts
 of short parallel classifier jobs on three slots: the working set went 2.8 → 7.1 GiB in four
