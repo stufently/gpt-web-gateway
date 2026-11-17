@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.17.1 — 2026-11-17
 
 An edit could return the caller's own upload as the result. On 2026-11-17 two thinking-mode
 edits logged `Image generation detected` the instant the prompt was sent, then `No new image
