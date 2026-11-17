@@ -11,7 +11,7 @@ const assert = require('node:assert');
 const crypto = require('node:crypto');
 
 // ---- DOM stub ---------------------------------------------------------------
-// Images carry a 16x16 RGB thumbnail (`fp`) that the stub canvas hands back from getImageData,
+// Images carry a 32x32 RGB thumbnail (`fp`) that the stub canvas hands back from getImageData,
 // so the page-side fingerprint code runs for real. `inUserTurn` is false for the upload on
 // purpose: the live failure is ChatGPT markup the user-turn filter does not recognise.
 function makeImg({ src, fp, inUserTurn = false, naturalWidth = 1024, naturalHeight = 1024, complete = true }) {
@@ -19,12 +19,12 @@ function makeImg({ src, fp, inUserTurn = false, naturalWidth = 1024, naturalHeig
 }
 function solid(r, g, b) {
   const out = [];
-  for (let i = 0; i < 256; i++) out.push(r, g, b);
+  for (let i = 0; i < 1024; i++) out.push(r, g, b);
   return out;
 }
 function rgbaOf(fp) {
-  const d = new Uint8ClampedArray(256 * 4);
-  for (let i = 0; i < 256; i++) {
+  const d = new Uint8ClampedArray(1024 * 4);
+  for (let i = 0; i < 1024; i++) {
     d[i * 4] = fp[i * 3]; d[i * 4 + 1] = fp[i * 3 + 1]; d[i * 4 + 2] = fp[i * 3 + 2]; d[i * 4 + 3] = 255;
   }
   return d;
@@ -78,16 +78,20 @@ const INPUT_FP = solid(200, 30, 30);
 // ChatGPT re-encodes the upload: same picture, a couple of levels off here and there.
 const INPUT_REENCODED_FP = INPUT_FP.map((v, i) => (i % 7 === 0 ? Math.min(255, v + 3) : v));
 const RESULT_FP = solid(30, 30, 200);
-// A real edit that keeps most of the picture: a 4x4 patch (1/16 of the area) changed.
+// A real edit that keeps most of the picture: a 4x4 patch (1/64 of the area) changed.
 const SMALL_EDIT_FP = INPUT_FP.map((v, i) => {
   const px = Math.floor(i / 3);
-  const x = px % 16; const y = Math.floor(px / 16);
+  const x = px % 32; const y = Math.floor(px / 32);
   if (x < 4 && y < 4) return (i % 3 === 2) ? 255 : 0;
   return v;
 });
+// Codex review: removing a 48x48 mark from a 1024x1024 picture. At 32x32 it is about one cell,
+// shifted by ~60 levels; the MEAN delta over the thumbnail is under 0.2 — a mean threshold took
+// this legitimate result for the upload.
+const TINY_EDIT_FP = INPUT_FP.map((v, i) => (Math.floor(i / 3) === 500 ? Math.max(0, v - 60) : v));
 
 const PREV = { previousImageIds: [], previousLargeImages: [], previousTailText: 'old tail before submit' };
-const ECHO_ARGS = { echoSrcs: [], echoFingerprints: [INPUT_FP], echoMaxDiff: 2 };
+const ECHO_ARGS = { echoSrcs: [], echoFingerprints: [INPUT_FP], echoMaxDiff: 10 };
 
 // ---- imageOutcomePredicate ----------------------------------------------------
 // 1. THE live failure: the sent upload renders as a large image OUTSIDE recognised user-turn
@@ -99,7 +103,7 @@ check('predicate: re-encoded upload (no user-turn marker) is not success',
 // 2. Same, recognised by src (it appeared right after submit) even without a fingerprint.
 check('predicate: upload src seen after submit is not success',
   withDocument({ imgs: [makeImg({ src: 'blob:sent-upload' })] },
-    () => imageOutcomePredicate({ ...PREV, echoSrcs: ['blob:sent-upload'], echoFingerprints: [], echoMaxDiff: 2 })),
+    () => imageOutcomePredicate({ ...PREV, echoSrcs: ['blob:sent-upload'], echoFingerprints: [], echoMaxDiff: 10 })),
   false);
 // 3. Upload + a genuinely new result → success.
 check('predicate: real result next to the upload is success',
@@ -136,7 +140,7 @@ check('extract: picks the result, skips the later upload',
 // 9. Upload known by src only.
 check('extract: upload src excluded',
   withDocument({ imgs: [makeImg({ src: 'blob:upload' })] },
-    () => canvasExtractInPage({ targetId: null, prevSrcs: [], echoSrcs: ['blob:upload'], echoFingerprints: [], echoMaxDiff: 2 }).error),
+    () => canvasExtractInPage({ targetId: null, prevSrcs: [], echoSrcs: ['blob:upload'], echoFingerprints: [], echoMaxDiff: 10 }).error),
   'No new large image found yet');
 
 // ---- Node-side byte check ---------------------------------------------------------
@@ -228,6 +232,26 @@ async function run(dom, echo, beforeState = { imageIds: [], largeImages: [], tai
     );
     check('e2e: old container is not a fallback target', result ? result.url : null, null);
     check('e2e: old container → no_new_image', error && error.code, 'no_new_image');
+  }
+
+  // 15. Codex review: a one-cell local edit goes through the production threshold.
+  {
+    const { result, error } = await run(
+      { imgs: [makeImg({ src: 'blob:tiny-edit', fp: TINY_EDIT_FP }), makeImg({ src: 'blob:upload', fp: INPUT_FP })] },
+      { srcs: [], fingerprints: [INPUT_FP], shas: [] },
+    );
+    check('e2e: one-cell local edit returned', result ? result.url : (error && error.message), 'blob:tiny-edit');
+  }
+  // 16. Codex review: with every upload fingerprinted the post-submit src snapshot is skipped —
+  // a fast result already on the page must not be excluded by src alone.
+  {
+    const dom = { imgs: [makeImg({ src: 'blob:fast-result', fp: RESULT_FP })] };
+    const page = makePage(dom);
+    const before = { imageIds: [], largeImages: [], tailText: '' };
+    const full = await _test.snapshotSentImages(page, before, { srcs: [], fingerprints: [INPUT_FP], shas: [], uploads: 1 });
+    check('snapshot skipped when all uploads fingerprinted', full.srcs, []);
+    const blind = await _test.snapshotSentImages(page, before, { srcs: [], fingerprints: [], shas: [], uploads: 1 });
+    check('snapshot used when an upload has no fingerprint', blind.srcs, ['blob:fast-result']);
   }
 
   if (failed > 0) {

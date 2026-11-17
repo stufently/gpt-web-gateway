@@ -10,9 +10,10 @@ recognises, so it counted as a new image, and the current UI has no `image-*` co
 all, so the "last in DOM" fallback ran on every request.
 
 - Echo guard. Every uploaded file (edit primary and references) is excluded from results three
-  ways: images that appear with the sent message right after submit, a page-side 16×16 RGB
-  thumbnail match (`IMAGE_ECHO_MAX_DIFF`, default 2), and a byte-exact sha256 check on whatever
-  gets extracted. It applies to the success predicate too, so the upload no longer fakes an
+  ways: a page-side 32×32 RGB thumbnail match (every cell within `IMAGE_ECHO_MAX_DIFF`,
+  default 10), a byte-exact sha256 check on whatever gets extracted, and — only for an upload
+  the browser could not fingerprint — images that appear with the sent message right after
+  submit. It applies to the success predicate too, so the upload no longer fakes an
   instant "generation detected".
 - The "last image container in the DOM" fallback is gone: without a new container the page-wide
   search honours the pre-submit snapshot and the echo guard.

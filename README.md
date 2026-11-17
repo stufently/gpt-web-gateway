@@ -289,7 +289,7 @@ Every endpoint returns a uniform error shape:
 | `GENERATION_MAX_TIMEOUT_SEC` | Hard ceiling for the whole image wait (first window + all extensions). Keep ≤ your proxy read timeout | `600` |
 | `RENDER_WAIT_SEC` | Extra wait after "Image created" before extraction | `15` |
 | `IMAGE_RESULT_WAIT_SEC` | After generation is detected, how long to keep polling (every 3 s) for the new image in the reply before failing with `no_new_image` | `150` |
-| `IMAGE_ECHO_MAX_DIFF` | Echo guard: an image whose 16×16 RGB thumbnail is within this mean per-channel delta (0–255) of an uploaded file is treated as the upload, never as the result | `2` |
+| `IMAGE_ECHO_MAX_DIFF` | Echo guard: an image whose 32×32 RGB thumbnail is within this delta (0–255) of an uploaded file in every channel of every cell is treated as the upload, never as the result | `10` |
 | `UPLOAD_MAX_ATTEMPTS` | Retries for attaching files to the composer before failing `upload_failed` | `3` |
 | `CAPABILITIES_CACHE_TTL_MS` | Cache TTL for `/v1/images/capabilities` probe | `60000` |
 | `CHAT_COMPLETION_TIMEOUT_SEC` | Base wait for a text answer. The cluster runs **600** for the Extra High / Pro tiers, which think for minutes; see the ladder note on `CF_LOAD_BUDGET_SEC` before changing it | `360` |

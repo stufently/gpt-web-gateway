@@ -104,12 +104,15 @@ const RENDER_WAIT_MS = safePositiveInt(process.env.RENDER_WAIT_SEC, 15) * 1000;
 // edits returned the input picture as the result). Thinking-mode edits can take minutes.
 const IMAGE_RESULT_WAIT_MS = safePositiveInt(process.env.IMAGE_RESULT_WAIT_SEC, 150) * 1000;
 const IMAGE_RESULT_POLL_MS = 3000;
-// Echo guard: an image whose 16x16 RGB thumbnail differs from an uploaded file by at most this
-// mean per-channel delta (0-255) is the upload itself (re-encoded/resized by ChatGPT), not a
-// result. A real edit is re-synthesized and differs far more even when only a detail changed.
+// Echo guard: an image whose 32x32 RGB thumbnail is within this delta (0-255) of an uploaded
+// file in EVERY channel of EVERY cell is the upload itself (re-encoded/resized by ChatGPT), not
+// a result. Max, not mean: a mean hides a local edit (a 48x48 mark removed from 1024x1024 moves
+// the mean by ~0.5), while one changed cell of a 32x32 grid moves its max by the full contrast.
+// Re-encode noise averages out inside a cell. Changes far below one cell (1/32 of a side) can
+// look like an echo — that ends in `no_new_image`, never in a wrong picture.
 const IMAGE_ECHO_MAX_DIFF = (() => {
   const n = Number(process.env.IMAGE_ECHO_MAX_DIFF);
-  return Number.isFinite(n) && n >= 0 ? n : 2;
+  return Number.isFinite(n) && n >= 0 ? n : 10;
 })();
 // Snapshots may contain prompts and chat history — opt-in only
 const DEBUG_SNAPSHOTS_ENABLED = process.env.DEBUG_SNAPSHOTS === '1' || process.env.DEBUG_SNAPSHOTS === 'true';
@@ -2270,11 +2273,11 @@ function canvasExtractInPage({ targetId, prevSrcs, echoSrcs = [], echoFingerprin
   const fingerprint = (img) => {
     try {
       const c = document.createElement('canvas');
-      c.width = 16; c.height = 16;
+      c.width = 32; c.height = 32;
       const ctx = c.getContext('2d');
       ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(img, 0, 0, 16, 16);
-      const d = ctx.getImageData(0, 0, 16, 16).data;
+      ctx.drawImage(img, 0, 0, 32, 32);
+      const d = ctx.getImageData(0, 0, 32, 32).data;
       const out = [];
       for (let i = 0; i < d.length; i += 4) out.push(d[i], d[i + 1], d[i + 2]);
       return out;
@@ -2286,7 +2289,7 @@ function canvasExtractInPage({ targetId, prevSrcs, echoSrcs = [], echoFingerprin
     const fp = fingerprint(img);
     if (!fp) return false;
     return echoFingerprints.some((ref) => ref && ref.length === fp.length
-      && fp.reduce((sum, v, i) => sum + Math.abs(v - ref[i]), 0) / fp.length <= echoMaxDiff);
+      && fp.every((v, i) => Math.abs(v - ref[i]) <= echoMaxDiff));
   };
   const imgs = scope ? scope.querySelectorAll('img') : document.querySelectorAll('img');
   // Walk from end → first valid is the newest
@@ -2364,11 +2367,11 @@ function imageOutcomePredicate({ previousImageIds, previousLargeImages, previous
   const fingerprint = (img) => {
     try {
       const c = document.createElement('canvas');
-      c.width = 16; c.height = 16;
+      c.width = 32; c.height = 32;
       const ctx = c.getContext('2d');
       ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(img, 0, 0, 16, 16);
-      const d = ctx.getImageData(0, 0, 16, 16).data;
+      ctx.drawImage(img, 0, 0, 32, 32);
+      const d = ctx.getImageData(0, 0, 32, 32).data;
       const out = [];
       for (let i = 0; i < d.length; i += 4) out.push(d[i], d[i + 1], d[i + 2]);
       return out;
@@ -2378,12 +2381,13 @@ function imageOutcomePredicate({ previousImageIds, previousLargeImages, previous
   const isEcho = (img) => {
     if (echoSrcs.includes(img.src)) return true;
     if (!echoFingerprints.length) return false;
-    const refsKey = echoFingerprints.map((f) => (f || []).slice(0, 12).join(',')).join(';');
+    // Whole-fingerprint hash: a prefix would collide for uploads sharing a corner (agy review).
+    const refsKey = echoFingerprints.map((f) => (f || []).reduce((h, v) => ((h * 31) + v) | 0, 7)).join(';');
     const key = `${refsKey}|${img.naturalWidth}x${img.naturalHeight}|${img.src}`;
     if (echoCache.has(key)) return echoCache.get(key);
     const fp = fingerprint(img);
     const verdict = !!fp && echoFingerprints.some((ref) => ref && ref.length === fp.length
-      && fp.reduce((sum, v, i) => sum + Math.abs(v - ref[i]), 0) / fp.length <= echoMaxDiff);
+      && fp.every((v, i) => Math.abs(v - ref[i]) <= echoMaxDiff));
     // Only a fully decoded image gives a final verdict; a half-loaded one is re-checked.
     if (img.complete !== false) {
       if (echoCache.size > 200) echoCache.clear();
@@ -2976,7 +2980,7 @@ function isUploadEcho(b64, shas) {
   return shas.includes(sha256Hex(Buffer.from(b64, 'base64')));
 }
 
-// Page-side 16x16 RGB thumbnails of the uploaded files, computed the same way as in
+// Page-side 32x32 RGB thumbnails of the uploaded files, computed the same way as in
 // imageOutcomePredicate/canvasExtractInPage. A file the browser cannot decode yields no entry:
 // the src snapshot and the byte check still guard it.
 function uploadFingerprintsInPage(dataUrls) {
@@ -2985,11 +2989,11 @@ function uploadFingerprintsInPage(dataUrls) {
     img.onload = () => {
       try {
         const c = document.createElement('canvas');
-        c.width = 16; c.height = 16;
+        c.width = 32; c.height = 32;
         const ctx = c.getContext('2d');
         ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(img, 0, 0, 16, 16);
-        const d = ctx.getImageData(0, 0, 16, 16).data;
+        ctx.drawImage(img, 0, 0, 32, 32);
+        const d = ctx.getImageData(0, 0, 32, 32).data;
         const out = [];
         for (let i = 0; i < d.length; i += 4) out.push(d[i], d[i + 1], d[i + 2]);
         resolve(out);
@@ -3013,13 +3017,16 @@ async function buildUploadEcho(p, files) {
     return [];
   });
   console.log(`[echo-guard] guarding ${list.length} upload(s): ${fingerprints.length} fingerprint(s), ${shas.length} sha(s)`);
-  return { srcs: [], fingerprints, shas };
+  return { srcs: [], fingerprints, shas, uploads: list.length };
 }
 
-// Large images that appeared between the pre-submit snapshot and now (right after submit) can
-// only be the message just sent — ChatGPT cannot have rendered a result yet.
+// Fallback for uploads the browser could not fingerprint: large images that appeared between
+// the pre-submit snapshot and now (right after submit) are taken as the sent message. Not used
+// when every upload has a fingerprint — submit confirmation can take several seconds, and a
+// fast result already on the page would be excluded by src alone (Codex review).
 async function snapshotSentImages(p, beforeState, echo) {
   if (!echo) return echo;
+  if ((echo.fingerprints || []).length >= (echo.uploads || 0)) return echo;
   const prev = beforeState.largeImages || [];
   const srcs = await p.evaluate((prevSrcs) => Array.from(document.querySelectorAll('img'))
     .filter((img) => img.naturalWidth > 200 && img.naturalHeight > 200 && img.src)
