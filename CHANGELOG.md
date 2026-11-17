@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+An edit could return the caller's own upload as the result. On 2026-11-17 two thinking-mode
+edits logged `Image generation detected` the instant the prompt was sent, then `No new image
+container found vs beforeState — falling back to last in DOM`, and answered with the input
+picture (same sha256). The sent attachment rendered outside the markup the user-turn filter
+recognises, so it counted as a new image, and the current UI has no `image-*` containers at
+all, so the "last in DOM" fallback ran on every request.
+
+- Echo guard. Every uploaded file (edit primary and references) is excluded from results three
+  ways: images that appear with the sent message right after submit, a page-side 16×16 RGB
+  thumbnail match (`IMAGE_ECHO_MAX_DIFF`, default 2), and a byte-exact sha256 check on whatever
+  gets extracted. It applies to the success predicate too, so the upload no longer fakes an
+  instant "generation detected".
+- The "last image container in the DOM" fallback is gone: without a new container the page-wide
+  search honours the pre-submit snapshot and the echo guard.
+- After generation is detected, extraction polls every 3 s for up to `IMAGE_RESULT_WAIT_SEC`
+  (default 150) instead of about a minute, and then fails with the new retryable
+  `error_kind: no_new_image` (HTTP 502) instead of returning a wrong picture.
+- Tests: `scripts/test-image-echo.js`.
+
 ## 2.17.0 — 2026-11-10
 
 Recycle by memory. On 06.11 and 09.11 the pod was OOMKilled at its 8Gi limit during bursts

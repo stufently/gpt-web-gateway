@@ -19,6 +19,7 @@ const { trimConversationData } = require('./lib/conversation-trim');
 // local `progress` indicator object inside waitAndExtractImage.
 const { progress: liveness } = require('./progress');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const CHATGPT_URL = 'https://chatgpt.com';
 
@@ -97,6 +98,19 @@ const TEXT_HARD_RESET_ENABLED =
   (process.env.BROWSER_MODE || 'default') !== 'cdp';
 // Image 2.0 standard mode renders in 10-25s (was 60-120s for Image 1.5) → shorter render wait OK
 const RENDER_WAIT_MS = safePositiveInt(process.env.RENDER_WAIT_SEC, 15) * 1000;
+// After generation is detected, how long to keep polling for the NEW image in the assistant
+// reply before failing with `no_new_image`. A fixed short wait used to fall through to "last
+// image in the DOM", which in an edit is the caller's own upload (2026-11-17: thinking-mode
+// edits returned the input picture as the result). Thinking-mode edits can take minutes.
+const IMAGE_RESULT_WAIT_MS = safePositiveInt(process.env.IMAGE_RESULT_WAIT_SEC, 150) * 1000;
+const IMAGE_RESULT_POLL_MS = 3000;
+// Echo guard: an image whose 16x16 RGB thumbnail differs from an uploaded file by at most this
+// mean per-channel delta (0-255) is the upload itself (re-encoded/resized by ChatGPT), not a
+// result. A real edit is re-synthesized and differs far more even when only a detail changed.
+const IMAGE_ECHO_MAX_DIFF = (() => {
+  const n = Number(process.env.IMAGE_ECHO_MAX_DIFF);
+  return Number.isFinite(n) && n >= 0 ? n : 2;
+})();
 // Snapshots may contain prompts and chat history — opt-in only
 const DEBUG_SNAPSHOTS_ENABLED = process.env.DEBUG_SNAPSHOTS === '1' || process.env.DEBUG_SNAPSHOTS === 'true';
 const DEBUG_SNAPSHOT_DIR = process.env.DEBUG_SNAPSHOT_DIR || '/tmp/chatgpt-debug';
@@ -2249,8 +2263,31 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
 // self-contained (it runs in the browser) so scripts/test-refusal-detect.js can drive it
 // with a DOM stub. Never returns an image that was already on the page before submit,
 // except from inside this turn's own image container (`targetId`).
-function canvasExtractInPage({ targetId, prevSrcs }) {
+function canvasExtractInPage({ targetId, prevSrcs, echoSrcs = [], echoFingerprints = [], echoMaxDiff = 2 }) {
   const scope = targetId ? document.getElementById(targetId) : document;
+  // Echo guard (keep in sync with imageOutcomePredicate): never pick the caller's own upload,
+  // wherever the UI renders it — known src, or a thumbnail that matches an uploaded file.
+  const fingerprint = (img) => {
+    try {
+      const c = document.createElement('canvas');
+      c.width = 16; c.height = 16;
+      const ctx = c.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, 16, 16);
+      const d = ctx.getImageData(0, 0, 16, 16).data;
+      const out = [];
+      for (let i = 0; i < d.length; i += 4) out.push(d[i], d[i + 1], d[i + 2]);
+      return out;
+    } catch { return null; }
+  };
+  const isEcho = (img) => {
+    if (echoSrcs.includes(img.src)) return true;
+    if (!echoFingerprints.length) return false;
+    const fp = fingerprint(img);
+    if (!fp) return false;
+    return echoFingerprints.some((ref) => ref && ref.length === fp.length
+      && fp.reduce((sum, v, i) => sum + Math.abs(v - ref[i]), 0) / fp.length <= echoMaxDiff);
+  };
   const imgs = scope ? scope.querySelectorAll('img') : document.querySelectorAll('img');
   // Walk from end → first valid is the newest
   const all = Array.from(imgs);
@@ -2265,6 +2302,7 @@ function canvasExtractInPage({ targetId, prevSrcs }) {
     if (inUserTurn(img)) continue;
     // Skip images we already saw before submit (avoid stale extraction)
     if (prevSrcs.includes(img.src)) continue;
+    if (isEcho(img)) continue;
     bestImg = img;
     break;
   }
@@ -2280,6 +2318,7 @@ function canvasExtractInPage({ targetId, prevSrcs }) {
       if (img.naturalWidth <= 200 || img.naturalHeight <= 200 || !img.src) continue;
       if (img.src.startsWith('data:image/svg')) continue;
       if (inUserTurn(img)) continue;
+      if (isEcho(img)) continue;
       bestImg = img;
       break;
     }
@@ -2302,7 +2341,7 @@ function canvasExtractInPage({ targetId, prevSrcs }) {
 // Page-context predicate for waitForFunction. Returns one of:
 // 'success' | 'policy' | 'refused' | 'limit' | false (keep polling).
 // Lifted out so adaptive retry can reuse the exact same logic.
-function imageOutcomePredicate({ previousImageIds, previousLargeImages, previousTailText }) {
+function imageOutcomePredicate({ previousImageIds, previousLargeImages, previousTailText, echoSrcs = [], echoFingerprints = [], echoMaxDiff = 2 }) {
   const textRaw = document.body.innerText || '';
   // ChatGPT renders typographic apostrophes ("We’re so sorry", "can’t") — normalize to
   // straight quotes so ASCII patterns below actually match the live UI text.
@@ -2316,12 +2355,46 @@ function imageOutcomePredicate({ previousImageIds, previousLargeImages, previous
     .filter(notInUserTurn)
     .map(el => el.id)
     .filter(Boolean);
-  const largeImages = Array.from(document.querySelectorAll('img'))
+  const hasNewImageId = imageIds.some(id => !previousImageIds.includes(id));
+  // Echo guard (keep in sync with canvasExtractInPage). The user-turn filter above depends on
+  // ChatGPT's markup; when it misses, the just-sent upload shows up as a "new large image" the
+  // instant the prompt is sent and used to fake an immediate success (2026-11-17). An image is
+  // the upload if its src was seen right after submit or its thumbnail matches an uploaded file.
+  // Verdicts are cached per src: waitForFunction polls every animation frame.
+  const fingerprint = (img) => {
+    try {
+      const c = document.createElement('canvas');
+      c.width = 16; c.height = 16;
+      const ctx = c.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, 16, 16);
+      const d = ctx.getImageData(0, 0, 16, 16).data;
+      const out = [];
+      for (let i = 0; i < d.length; i += 4) out.push(d[i], d[i + 1], d[i + 2]);
+      return out;
+    } catch { return null; }
+  };
+  const echoCache = (globalThis.__gwEchoCache = globalThis.__gwEchoCache || new Map());
+  const isEcho = (img) => {
+    if (echoSrcs.includes(img.src)) return true;
+    if (!echoFingerprints.length) return false;
+    const refsKey = echoFingerprints.map((f) => (f || []).slice(0, 12).join(',')).join(';');
+    const key = `${refsKey}|${img.naturalWidth}x${img.naturalHeight}|${img.src}`;
+    if (echoCache.has(key)) return echoCache.get(key);
+    const fp = fingerprint(img);
+    const verdict = !!fp && echoFingerprints.some((ref) => ref && ref.length === fp.length
+      && fp.reduce((sum, v, i) => sum + Math.abs(v - ref[i]), 0) / fp.length <= echoMaxDiff);
+    // Only a fully decoded image gives a final verdict; a half-loaded one is re-checked.
+    if (img.complete !== false) {
+      if (echoCache.size > 200) echoCache.clear();
+      echoCache.set(key, verdict);
+    }
+    return verdict;
+  };
+  const hasNewLargeImage = Array.from(document.querySelectorAll('img'))
     .filter(img => img.naturalWidth > 200 && img.naturalHeight > 200 && img.src)
     .filter(notInUserTurn)
-    .map(img => img.src);
-  const hasNewImageId = imageIds.some(id => !previousImageIds.includes(id));
-  const hasNewLargeImage = largeImages.some(src => !previousLargeImages.includes(src));
+    .some(img => !previousLargeImages.includes(img.src) && !isEcho(img));
   const newTail = textRaw.slice(-500);
   const tailChanged = newTail !== previousTailText;
   const prevTextLower = normApos(previousTailText);
@@ -2492,10 +2565,21 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
     } catch {}
   }, 15000);
 
+  // Uploaded files (edit primary + references): never a valid result. `srcs` are images that
+  // appeared right after submit (the sent message), `fingerprints` page-side thumbnails of the
+  // uploads, `shas` the exact bytes — checked again in Node on whatever gets extracted.
+  const echo = {
+    srcs: (context.echo && context.echo.srcs) || [],
+    fingerprints: (context.echo && context.echo.fingerprints) || [],
+    shas: (context.echo && context.echo.shas) || [],
+  };
   const predicateArgs = {
     previousImageIds: beforeState.imageIds || [],
     previousLargeImages: beforeState.largeImages || [],
     previousTailText: beforeState.tailText || '',
+    echoSrcs: echo.srcs,
+    echoFingerprints: echo.fingerprints,
+    echoMaxDiff: IMAGE_ECHO_MAX_DIFF,
   };
 
   const logRefusal = (kind, modelMessage) => {
@@ -2661,6 +2745,7 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
       modelMessageByKind[result_type] || ''
     );
   }
+  const detectedAt = Date.now();
   console.log(`Image generation detected. Waiting ${RENDER_WAIT_MS / 1000}s for image to render...`);
   await p.waitForTimeout(RENDER_WAIT_MS).catch(() => console.log('Page navigated during render wait — continuing anyway'));
 
@@ -2766,21 +2851,17 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
     }
   }
 
-  // Pick the newest container (last in DOM order) as the canonical result.
-  const newImageId = newImageIds.length > 0
-    ? newImageIds[newImageIds.length - 1]
-    : await p.evaluate(() => {
-        const all = Array.from(document.querySelectorAll('div[id^="image-"]'))
-          .filter(el => !(el.closest && el.closest('[data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-user-message-bubble]')))
-          .map(el => el.id)
-          .filter(Boolean);
-        return all.length > 0 ? all[all.length - 1] : null;
-      });
+  // Pick the newest container (last in DOM order) as the canonical result. Without a NEW
+  // container there is no "last in DOM" fallback any more: an old container is an earlier
+  // turn's result or the caller's own upload, and the container relaxation in
+  // canvasExtractInPage would hand it out even though its src was seen before submit. The
+  // page-wide search below honours prevSrcs and the echo guard instead.
+  const newImageId = newImageIds.length > 0 ? newImageIds[newImageIds.length - 1] : null;
 
   if (newImageId) {
     console.log(`[extract] Targeting new image container: ${newImageId}`);
   } else {
-    console.log('[extract] No new image container found vs beforeState — falling back to last in DOM');
+    console.log('[extract] No new image container vs beforeState — searching the page for a new non-upload image');
   }
 
   // ChatGPT removed the per-image "Download this image" button (image toolbar
@@ -2816,37 +2897,136 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
     const filePath = await download.path();
     const buffer = fs.readFileSync(filePath);
     const base64 = buffer.toString('base64');
-    const ext = download.suggestedFilename().split('.').pop();
-    const contentType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
-    return { url: download.url(), b64_json: base64, contentType, ab_variants: abVariants, ab_selected_index: abSelectedIndex };
+    if (isUploadEcho(base64, echo.shas)) {
+      console.log('[extract] Downloaded file is byte-identical to an uploaded file — ignoring it');
+    } else {
+      const ext = download.suggestedFilename().split('.').pop();
+      const contentType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+      return { url: download.url(), b64_json: base64, contentType, ab_variants: abVariants, ab_selected_index: abSelectedIndex };
+    }
   }
 
-  // Fallback: canvas extraction with polling until image is fully loaded
-  // Prefer img inside the new image container (if known); otherwise pick the LAST
-  // large img in the page — newest in DOM order is the freshly generated one.
-  const previousLargeImages = beforeState.largeImages || [];
+  // Canvas extraction, polled until the new image is in the page. Prefer an img inside the
+  // new container (if known); otherwise the LAST large img that was not on the page before
+  // submit and is not one of the uploads. Polling runs up to IMAGE_RESULT_WAIT_MS from the
+  // moment generation was detected: thinking-mode edits finish well after the first signal.
+  const prevSrcs = [...(beforeState.largeImages || []), ...echo.srcs];
+  const extractDeadline = detectedAt + IMAGE_RESULT_WAIT_MS;
+  let lastError = '';
+  let echoRejected = 0;
   console.log('Extracting image via canvas...');
-  for (let i = 0; i < 12; i++) {
-    const result = await p.evaluate(canvasExtractInPage, { targetId: newImageId, prevSrcs: previousLargeImages });
+  for (let attempt = 1; ; attempt++) {
+    const result = await p.evaluate(canvasExtractInPage, {
+      targetId: newImageId,
+      prevSrcs,
+      echoSrcs: echo.srcs,
+      echoFingerprints: echo.fingerprints,
+      echoMaxDiff: IMAGE_ECHO_MAX_DIFF,
+    });
 
     if (!result.error) {
-      console.log('Canvas extraction successful.');
-      return { url: result.src, b64_json: result.b64, contentType: result.contentType, ab_variants: abVariants, ab_selected_index: abSelectedIndex };
+      if (isUploadEcho(result.b64, echo.shas)) {
+        // Byte-identical to an upload: the page guard missed it (e.g. the fingerprint could not
+        // be read). Exclude this src and keep waiting for the real result.
+        echoRejected++;
+        console.log(`[extract] Candidate ${String(result.src || '').slice(0, 80)} is byte-identical to an uploaded file — skipping`);
+        if (result.src) prevSrcs.push(result.src);
+      } else {
+        console.log('Canvas extraction successful.');
+        return { url: result.src, b64_json: result.b64, contentType: result.contentType, ab_variants: abVariants, ab_selected_index: abSelectedIndex };
+      }
+    } else {
+      lastError = result.error;
     }
 
-    console.log(`Canvas attempt ${i + 1}: ${result.error}. Waiting 5s...`);
-    await p.waitForTimeout(5000);
+    const remaining = extractDeadline - Date.now();
+    if (remaining <= 0) break;
+    liveness.touch(slotOf(p).jobId); // still polling a detected generation — not a wedged job
+    if (attempt === 1 || attempt % 10 === 0) {
+      console.log(`Canvas attempt ${attempt}: ${lastError || 'upload echo'}. Polling every ${IMAGE_RESULT_POLL_MS / 1000}s, ${Math.ceil(remaining / 1000)}s left...`);
+    }
+    await p.waitForTimeout(Math.min(IMAGE_RESULT_POLL_MS, remaining));
   }
 
-  // Extraction exhausted — do NOT return a fake success (a null b64_json used to travel
-  // to the client as HTTP 200). Surface a typed retryable error with any visible UI
-  // banner text attached so the caller understands what the page showed.
-  await saveDebugSnapshot(p, 'extract_failed').catch(() => {});
+  // Do NOT return a fake success: neither a null b64_json (used to travel as HTTP 200) nor the
+  // caller's own upload (2026-11-17). A typed retryable error, with any visible UI banner text.
+  await saveDebugSnapshot(p, 'no_new_image').catch(() => {});
+  const waitedSec = Math.round((Date.now() - detectedAt) / 1000);
+  if (lastError === 'No new large image found yet' || echoRejected > 0) {
+    throw buildError(
+      'no_new_image',
+      `Image generation was detected but no new image appeared in the reply within ${waitedSec}s`
+        + (echoRejected > 0 || echo.srcs.length || echo.fingerprints.length ? ' (the uploaded image is never returned as the result)' : ''),
+      await readUiErrorBanner(p)
+    );
+  }
   throw buildError(
     'server_error',
-    'Image generation was detected but the image could not be extracted from the page',
+    `Image generation was detected but the image could not be extracted from the page${lastError ? ` (${lastError})` : ''}`,
     await readUiErrorBanner(p)
   );
+}
+
+// Exact-bytes echo check, Node side: the last line of defence behind the page guard.
+function sha256Hex(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+function isUploadEcho(b64, shas) {
+  if (!b64 || !shas || shas.length === 0) return false;
+  return shas.includes(sha256Hex(Buffer.from(b64, 'base64')));
+}
+
+// Page-side 16x16 RGB thumbnails of the uploaded files, computed the same way as in
+// imageOutcomePredicate/canvasExtractInPage. A file the browser cannot decode yields no entry:
+// the src snapshot and the byte check still guard it.
+function uploadFingerprintsInPage(dataUrls) {
+  const one = (url) => new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const c = document.createElement('canvas');
+        c.width = 16; c.height = 16;
+        const ctx = c.getContext('2d');
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(img, 0, 0, 16, 16);
+        const d = ctx.getImageData(0, 0, 16, 16).data;
+        const out = [];
+        for (let i = 0; i < d.length; i += 4) out.push(d[i], d[i + 1], d[i + 2]);
+        resolve(out);
+      } catch { resolve(null); }
+    };
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+  return Promise.all(dataUrls.map(one)).then((list) => list.filter(Boolean));
+}
+
+// Echo context for waitAndExtractImage, built from the files actually sent with the prompt.
+// Called before submit (fingerprints + shas); `snapshotSentImages` adds the srcs right after.
+async function buildUploadEcho(p, files) {
+  const list = (files || []).filter((f) => f && Buffer.isBuffer(f.buffer) && f.buffer.length > 0);
+  if (list.length === 0) return null;
+  const shas = list.map((f) => sha256Hex(f.buffer));
+  const dataUrls = list.map((f) => `data:${f.mimeType || 'image/png'};base64,${f.buffer.toString('base64')}`);
+  const fingerprints = await p.evaluate(uploadFingerprintsInPage, dataUrls).catch((e) => {
+    console.log(`[echo-guard] upload fingerprints unavailable: ${e.message}`);
+    return [];
+  });
+  console.log(`[echo-guard] guarding ${list.length} upload(s): ${fingerprints.length} fingerprint(s), ${shas.length} sha(s)`);
+  return { srcs: [], fingerprints, shas };
+}
+
+// Large images that appeared between the pre-submit snapshot and now (right after submit) can
+// only be the message just sent — ChatGPT cannot have rendered a result yet.
+async function snapshotSentImages(p, beforeState, echo) {
+  if (!echo) return echo;
+  const prev = beforeState.largeImages || [];
+  const srcs = await p.evaluate((prevSrcs) => Array.from(document.querySelectorAll('img'))
+    .filter((img) => img.naturalWidth > 200 && img.naturalHeight > 200 && img.src)
+    .map((img) => img.src)
+    .filter((src) => !prevSrcs.includes(src) && !src.startsWith('data:image/svg')), prev).catch(() => []);
+  if (srcs.length) console.log(`[echo-guard] ${srcs.length} image(s) appeared with the sent message — excluded from results`);
+  return { ...echo, srcs: [...new Set([...(echo.srcs || []), ...srcs])] };
 }
 
 // fill() of a long prompt is one ProseMirror transaction, and ChatGPT's composer handlers
@@ -4576,12 +4756,15 @@ async function generateImage(prompt, options = {}) {
   const finalPrompt = appendAspectRatioHint(`Generate an image: ${prompt}${qualityHint}`, options.aspectRatio);
   const beforeState = await captureConversationState(p);
   const preserveAttachments = isFirstTurn && referencesAttached > 0;
+  let echo = preserveAttachments ? await buildUploadEcho(p, options.references) : null;
   if (typeof options.beforeSubmit === 'function') await options.beforeSubmit();
   await typeAndSubmit(p, finalPrompt, preserveAttachments);
+  echo = await snapshotSentImages(p, beforeState, echo);
   const result = await waitAndExtractImage(p, beforeState, {
     prompt,
     thinkingMode: thinkingState.mode || thinkingMode,
     refs: referencesAttached,
+    echo,
   });
   if (thinkingState.verified) markHealthyCompletion(slot);
   return {
@@ -4635,12 +4818,15 @@ async function editImage(prompt, imageInput, options = {}) {
   const qualityHint = options.quality ? `\n\nQuality: ${options.quality}.` : '';
   const finalPrompt = appendAspectRatioHint(`Edit this image: ${prompt}${qualityHint}`, options.aspectRatio);
   const beforeState = await captureConversationState(p);
+  let echo = await buildUploadEcho(p, [imageInput, ...refs]);
   if (typeof options.beforeSubmit === 'function') await options.beforeSubmit();
   await typeAndSubmit(p, finalPrompt, true);
+  echo = await snapshotSentImages(p, beforeState, echo);
   const result = await waitAndExtractImage(p, beforeState, {
     prompt,
     thinkingMode: thinkingState.mode || thinkingMode,
     refs: referencesConfirmed,
+    echo,
   });
   if (thinkingState.verified) markHealthyCompletion(slot);
   return {
@@ -5018,6 +5204,10 @@ module.exports = {
     setThinkingMode,
     waitAndExtractImage,
     canvasExtractInPage,
+    isUploadEcho,
+    buildUploadEcho,
+    snapshotSentImages,
+    IMAGE_RESULT_WAIT_MS,
     menuFailures: () => getSlot(0).menuFailures,
     resetMenuFailures: () => { getSlot(0).menuFailures = 0; },
     acceptSseChunk,

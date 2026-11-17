@@ -29,6 +29,10 @@ const counters = {
     // and the conversation stopped changing. Upstream failure, not our timeout: a retry is a
     // fresh turn and usually answers.
     empty_turn: 0,
+    // Image generation was detected but no NEW image appeared in the reply before
+    // IMAGE_RESULT_WAIT_SEC. Returned instead of the old "last image in the DOM" fallback,
+    // which in an edit was the caller's own upload. Upstream/slow render: a retry is fresh.
+    no_new_image: 0,
   },
   generations_total: 0,
   edits_total: 0,
@@ -41,7 +45,7 @@ const DURATION_BUCKETS = [5, 10, 20, 30, 60, 90, 120, 180, 240, 300];
 const DURATION_LABELS = [
   'success', 'refused', 'policy_violation', 'rate_limit', 'login_failed',
   'timeout', 'server_error', 'queue_full', 'upload_failed', 'page_load_failed',
-  'conversation_not_found', 'tier_limit', 'prompt_too_long', 'empty_turn',
+  'conversation_not_found', 'tier_limit', 'prompt_too_long', 'empty_turn', 'no_new_image',
 ];
 
 function makeHistogramSeries() {
@@ -106,6 +110,8 @@ function shouldRetryKind(kind) {
     case 'tier_limit':
     // A fresh turn usually answers: the empty one was dropped by ChatGPT, not by the input.
     case 'empty_turn':
+    // The image was still rendering or the turn produced none; a fresh turn usually delivers.
+    case 'no_new_image':
       return true;
     default:
       return false; // refused, policy_violation, rate_limit, invalid_request, unknown

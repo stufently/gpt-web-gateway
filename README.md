@@ -247,6 +247,7 @@ Every endpoint returns a uniform error shape:
 | 429 | `rate_limit` | false — wait `Retry-After` |
 | 429 | `queue_full` | true |
 | 500 | `server_error` | true |
+| 502 | `no_new_image` | true — an image was detected but no new one appeared in the reply within `IMAGE_RESULT_WAIT_SEC`; the uploaded input is never returned in its place |
 | 503 | `login_failed` / `upload_failed` / `page_load_failed` | true |
 | 504 | `timeout` | true |
 
@@ -287,6 +288,8 @@ Every endpoint returns a uniform error shape:
 | `GENERATION_RETRY_TIMEOUT_SEC` | Size of one adaptive extension, granted only while the page shows live generation progress (stop button / "creating image") | `90` |
 | `GENERATION_MAX_TIMEOUT_SEC` | Hard ceiling for the whole image wait (first window + all extensions). Keep ≤ your proxy read timeout | `600` |
 | `RENDER_WAIT_SEC` | Extra wait after "Image created" before extraction | `15` |
+| `IMAGE_RESULT_WAIT_SEC` | After generation is detected, how long to keep polling (every 3 s) for the new image in the reply before failing with `no_new_image` | `150` |
+| `IMAGE_ECHO_MAX_DIFF` | Echo guard: an image whose 16×16 RGB thumbnail is within this mean per-channel delta (0–255) of an uploaded file is treated as the upload, never as the result | `2` |
 | `UPLOAD_MAX_ATTEMPTS` | Retries for attaching files to the composer before failing `upload_failed` | `3` |
 | `CAPABILITIES_CACHE_TTL_MS` | Cache TTL for `/v1/images/capabilities` probe | `60000` |
 | `CHAT_COMPLETION_TIMEOUT_SEC` | Base wait for a text answer. The cluster runs **600** for the Extra High / Pro tiers, which think for minutes; see the ladder note on `CF_LOAD_BUDGET_SEC` before changing it | `360` |
