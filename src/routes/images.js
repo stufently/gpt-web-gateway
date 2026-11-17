@@ -428,6 +428,8 @@ function respondWithError(res, startedAt, err) {
     page_load_failed: 503,
     // ChatGPT finished the turn without an answer — a bad upstream reply, not a slow one.
     empty_turn: 502,
+    // Generation detected, but no new image in the reply — never the upload instead.
+    no_new_image: 502,
     timeout: 504,
     server_error: 500,
   };
